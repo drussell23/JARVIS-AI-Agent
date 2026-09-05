@@ -82,4 +82,26 @@ RC=$?
 log "=== baseline exit=$RC ==="
 SESSION=$(ls -t .ouroboros/sessions 2>/dev/null | head -1)
 [ -n "$SESSION" ] && bash scripts/soaks/devtest_report.sh ".ouroboros/sessions/$SESSION/debug.log" 2>/dev/null
+
+# --- 5. record the control the promotion gate reads ------------------------
+# Without this the gate has nothing to compare against and refuses every
+# adapter with "cannot answer" -- correct, but it makes the baseline run
+# pointless. The scoring lives in reactor because the gate does; this
+# script supplies only the session and the model it was measured on, so
+# there is one definition of what "better" means and it is not here.
+REACTOR="${OV_REACTOR_TREE:-/mnt/c/Users/Jarvis/Desktop/TrinityAi/reactor}"
+RPY="${OV_REACTOR_PYTHON:-$HOME/.venvs/reactor-train/bin/python}"
+if [ -n "$SESSION" ] && [ -x "$RPY" ] && [ -d "$REACTOR" ]; then
+  HARNESS="devtest@$(git -C "$MAIN" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  log "recording baseline from $SESSION (model=$BASE_TAG harness=$HARNESS)"
+  if ( cd "$REACTOR" && "$RPY" -m reactor_core.deployment.devtest_baseline \
+         "$WT/.ouroboros/sessions/$SESSION" \
+         --base-model "$BASE_TAG" --harness "$HARNESS" ); then
+    log "baseline recorded — the promotion gate can now answer"
+  else
+    log "baseline NOT recorded (rc=$?) — the gate will refuse every adapter"
+  fi
+else
+  log "baseline NOT recorded: session=${SESSION:-none} python=$RPY reactor=$REACTOR"
+fi
 exit $RC

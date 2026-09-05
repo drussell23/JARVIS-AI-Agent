@@ -58,15 +58,27 @@ BASELINE_PATH=$(eval echo "$BASELINE_PATH")
 log "control on disk: $BASELINE_PATH"
 
 # --- 2. the card, and the tag ----------------------------------------------
+# What this guard is actually for: not contending with a TRAINING run, which
+# holds ~28 GiB and would push this run's model into a host-RAM spill. It is
+# NOT for waiting until the card is empty. ollama keeping a model resident on
+# its keep-alive is the normal state after any soak -- and it is the state
+# this run NEEDS, since the whole point is to talk to a served model. Gating
+# on raw free VRAM waits for a condition that will not arrive until the
+# keep-alive expires, which is how this script hung on its first run with
+# `holders=0 proc, gpu=22297 MiB used`.
+#
+# So: wait for competing PROCESSES. Then prove the card works the only way
+# that actually means anything -- the tag answers a probe (below). ollama
+# swaps its own models; a resident model is not an obstacle to it.
 if [ -n "$WAIT" ]; then
-  while pgrep -f "$HOLDERS" >/dev/null || [ "$(gpu_used_mib)" -gt "$FREE_MIB" ]; do
+  while pgrep -f "$HOLDERS" >/dev/null; do
     log "waiting: holders=$(pgrep -f "$HOLDERS" | wc -l) proc, gpu=$(gpu_used_mib) MiB used"
     sleep 60
   done
 fi
-pgrep -f "$HOLDERS" >/dev/null && die "something still holds the card; pass 'wait'"
+pgrep -f "$HOLDERS" >/dev/null && die "a training run or soak still holds the card; pass 'wait'"
 USED=$(gpu_used_mib); [ -n "$USED" ] || die "nvidia-smi gave no reading"
-[ "$USED" -le "$FREE_MIB" ] || die "card has $USED MiB in use (> $FREE_MIB)"
+log "card: $USED MiB in use (no competing process; ollama may hold a model)"
 
 curl -s -m 5 "$OLLAMA_API/api/tags" | grep -q "\"name\":\"$TAG\"" \
   || die "ollama does not serve '$TAG' -- convert and register the adapter first"

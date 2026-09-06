@@ -5385,6 +5385,12 @@ class BattleTestHarness:
                     _pot = getattr(self, "_per_op_transport", None)
                     if _pot is not None and hasattr(_pot, "markup_mirror"):
                         _pot.markup_mirror = bridge.publish_markup
+                    # The token stream rides the telemetry lane. A DIRECT
+                    # bridge ref, same idiom as markup_mirror above — never
+                    # the module-global helper, whose _ACTIVE_BRIDGE is
+                    # cleared on some mount paths while this bridge lives.
+                    if _pot is not None and hasattr(_pot, "telemetry_mirror"):
+                        _pot.telemetry_mirror = bridge.publish_telemetry
                     sf = getattr(self, "_serpent_flow", None)
                     if sf is not None:
                         sf.markup_mirror = bridge.publish_markup

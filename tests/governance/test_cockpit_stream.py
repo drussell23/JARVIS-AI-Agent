@@ -115,6 +115,7 @@ def _event(kind: str, op_id: str, content: str = "", provider: str = "") -> Any:
 async def test_the_first_token_goes_out_at_once_and_the_rest_coalesce(wire, monkeypatch):
     monkeypatch.setenv("JARVIS_CLAUDE_STYLE_STREAM_FLUSH_MS", "200")
     t = cst.ClaudeStyleTransport(console=_Console())
+    t.telemetry_mirror = lambda frame: wire.append(dict(frame))
     t.notify(_event("PHASE_BEGIN", "op-1", provider="local"))
     t.notify(_event("REASONING_TOKEN", "op-1", "I "))
     assert [f["text"] for f in wire] == ["I "]            # instant
@@ -126,6 +127,46 @@ async def test_the_first_token_goes_out_at_once_and_the_rest_coalesce(wire, monk
     t.notify(_event("PHASE_END", "op-1"))
     assert wire[-1] == {"kind": "stream_inflight", "op_id": "op-1", "text": "", "done": True}
     assert "op-1" not in t._streams
+
+
+@pytest.mark.asyncio
+async def test_the_transport_prefers_its_direct_mirror_over_the_global(monkeypatch):
+    """The bug this fixes: the module-global publish_telemetry_global reads
+    _ACTIVE_BRIDGE, cleared on some mount paths while the live bridge keeps
+    its clients. The transport holds a DIRECT bridge ref, like markup_mirror,
+    and the stream must ride it — never the global — when it is wired."""
+    global_calls: list = []
+    monkeypatch.setattr(ca, "publish_telemetry_global",
+                        lambda p: (global_calls.append(p) or True))
+    direct: list = []
+    t = cst.ClaudeStyleTransport(console=_Console())
+    t.telemetry_mirror = lambda frame: direct.append(dict(frame))
+    t.notify(_event("REASONING_TOKEN", "op-1", "hello"))
+    assert direct and direct[0]["text"] == "hello"
+    assert global_calls == []                       # never the global when mirrored
+
+
+@pytest.mark.asyncio
+async def test_without_a_mirror_the_stream_falls_back_to_the_global(wire, monkeypatch):
+    """The foreground/TTY path has no transport-held ref; the global is the
+    documented fallback there."""
+    monkeypatch.setenv("JARVIS_CLAUDE_STYLE_STREAM_FLUSH_MS", "1")
+    t = cst.ClaudeStyleTransport(console=_Console())
+    assert t.telemetry_mirror is None
+    t.notify(_event("REASONING_TOKEN", "op-1", "hi"))
+    assert wire and wire[0]["text"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_the_harness_arms_the_telemetry_mirror():
+    """The arming seam wires telemetry_mirror beside markup_mirror."""
+    import inspect
+    from backend.core.ouroboros.battle_test import harness as h
+    src = inspect.getsource(h)
+    assert "_pot.telemetry_mirror = bridge.publish_telemetry" in src
+    i = src.index("_pot.markup_mirror = bridge.publish_markup")
+    j = src.index("_pot.telemetry_mirror = bridge.publish_telemetry")
+    assert 0 < i < j                                 # armed together, mirror first
 
 
 @pytest.mark.asyncio
@@ -159,9 +200,15 @@ async def test_shutdown_drops_in_flight_streams(wire, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_reasoning_stream_reaches_the_cockpit_through_the_transport(wire, monkeypatch):
+async def test_a_reasoning_stream_reaches_the_cockpit_through_the_transport(monkeypatch):
+    """End to end via the DIRECT telemetry sink — the daemon's real path,
+    NOT the module-global helper (whose _ACTIVE_BRIDGE is unreliable)."""
     monkeypatch.setenv("JARVIS_CLAUDE_STYLE_STREAM_FLUSH_MS", "1")
+    # A dead global proves the direct sink is what carries the stream.
+    monkeypatch.setattr(ca, "publish_telemetry_global", lambda p: False)
+    seen: list = []
     t = cst.ClaudeStyleTransport(console=_Console())
+    t.telemetry_mirror = lambda frame: seen.append(dict(frame))
     conductor = rb.wire_render_conductor(per_op_transport=t)
     assert conductor is not None and t in conductor.backends()
     assert sr.owns_inflight_publishing("claude_style") and not sr.owns_inflight_publishing("stream_renderer")
@@ -173,9 +220,9 @@ async def test_a_reasoning_stream_reaches_the_cockpit_through_the_transport(wire
     cb("the callers")
     await asyncio.sleep(0.02)
     cb.end_callback()
-    texts = [f["text"] for f in wire]
+    texts = [f["text"] for f in seen]
     assert texts[0] == "Reading " and "Reading the callers" in texts
-    assert wire[-1]["done"] is True and wire[-1]["op_id"] == "op-9"
+    assert seen[-1]["done"] is True and seen[-1]["op_id"] == "op-9"
 
 
 # ---------------------------------------------------------------------------

@@ -396,6 +396,16 @@ class ClaudeStyleTransport:
         # ``None`` until wired. Every rendered line passes through
         # ``_safe_print``, so that one seam is where the mirror fires.
         self.markup_mirror: Optional[Callable[[str], None]] = None
+        # THE COCKPIT TELEMETRY MIRROR — a DIRECT ``bridge.publish_telemetry``
+        # reference, wired at the same attach-arming seam as ``markup_mirror``.
+        # The in-flight token stream rides the telemetry lane; it must NOT go
+        # through the module-global ``publish_telemetry_global``, whose
+        # ``_ACTIVE_BRIDGE`` is cleared on some mount paths while the live
+        # bridge keeps its clients (measured 2026-09-06: 4641 stream frames
+        # saw cockpits=0 through the global while a cockpit was attached and
+        # receiving heartbeats over the very same bridge). ``None`` until
+        # wired; then it is the sink the stream publishes through.
+        self.telemetry_mirror: Optional[Callable[[dict], None]] = None
         # CC2.1 — running counters for TASK_LIST composer field
         self._done_count: int = 0
         self._failed_count: int = 0
@@ -1106,7 +1116,9 @@ class ClaudeStyleTransport:
             from backend.core.ouroboros.battle_test.stream_renderer import (
                 publish_inflight_tail,
             )
-            publish_inflight_tail(op_id, state.text, done=done)
+            publish_inflight_tail(
+                op_id, state.text, done=done, sink=self.telemetry_mirror,
+            )
         except Exception:  # noqa: BLE001 — a dropped frame is a frame of smoothness
             logger.debug("[claude_style_transport] inflight publish degraded",
                          exc_info=True)

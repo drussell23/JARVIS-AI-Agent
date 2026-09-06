@@ -178,21 +178,26 @@ def owns_inflight_publishing(name: str) -> bool:
     return _INFLIGHT_PUBLISHER is None or _INFLIGHT_PUBLISHER == name
 
 
-def publish_inflight_tail(op_id: str, tail: str, *, done: bool = False) -> bool:
+def publish_inflight_tail(op_id: str, tail: str, *, done: bool = False,
+                          sink: "Optional[Any]" = None) -> bool:
     """The ONE producer of the ``stream_inflight`` frame.
 
     Carried on the telemetry lane rather than the markup lane because it is
     STATE, not a transcript entry: the last frame wins, and a dropped one
     costs a frame of smoothness rather than a lost line. The daemon's own
-    in-flight registry is fed FIRST — `publish_telemetry_global` is a no-op
-    with nobody attached, which is exactly when the daemon's own cockpit is
-    the surface being looked at. Returns whether a cockpit received it.
+    in-flight registry is fed FIRST, so the daemon's own cockpit sees the
+    tail even with nobody attached over the bridge.
 
-    Extracted from the renderer (2026-09-06) because the renderer is
-    TTY-gated: a headless daemon never constructs it, so the organism's
-    generation was invisible on every attached cockpit — the exact state
-    this frame exists to end. Any backend may now carry the tail.
-    NEVER raises.
+    ``sink`` is a DIRECT bridge reference (``bridge.publish_telemetry``,
+    wired onto the transport at the attach-arming seam exactly like
+    ``markup_mirror``). It is preferred over the module-global
+    ``publish_telemetry_global`` because the global reads ``_ACTIVE_BRIDGE``,
+    which is cleared on some mount paths while the live bridge — the one the
+    heartbeat and the voice lane hold directly — keeps its clients: measured
+    2026-09-06, 4641 inflight publishes all saw ``cockpits=0`` through the
+    global while a probe was attached and receiving heartbeats. The global
+    stays the fallback for the foreground/TTY path that has no transport to
+    carry a direct ref. NEVER raises.
     """
     frame = {
         "kind": "stream_inflight",
@@ -207,6 +212,12 @@ def publish_inflight_tail(op_id: str, tail: str, *, done: bool = False) -> bool:
         note_inflight_frame(frame)
     except Exception:  # noqa: BLE001
         pass
+    if sink is not None:
+        try:
+            sink(frame)
+            return True
+        except Exception:  # noqa: BLE001 — a dead sink falls back to the global
+            logger.debug("[StreamRender] inflight sink degraded", exc_info=True)
     try:
         from backend.core.ouroboros.battle_test.cockpit_attach import (  # noqa: PLC0415
             publish_telemetry_global,

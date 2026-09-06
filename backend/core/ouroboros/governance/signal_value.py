@@ -63,6 +63,28 @@ def signal_value_routing_enabled() -> bool:
     ).strip().lower() in _TRUTHY
 
 
+#: The default set of declared work-natures that make a signal COSMETIC
+#: regardless of its target file's AST — documentation, comments and style are
+#: changes that never touch an executable statement. DATA, not a threshold; a
+#: comma list in ``JARVIS_SIGNAL_COSMETIC_WORK_NATURES`` overrides it, so a
+#: deployment can add (or drop) natures without a code change.
+_DEFAULT_COSMETIC_WORK_NATURES = (
+    "documentation", "docstring", "doc", "comment", "cosmetic",
+    "style", "formatting", "typo",
+)
+
+
+def _cosmetic_work_natures() -> frozenset:
+    """The work-nature markers scored as the cosmetic class. Read at call time
+    (live-tunable). NEVER raises."""
+    raw = os.environ.get("JARVIS_SIGNAL_COSMETIC_WORK_NATURES", "").strip()
+    if raw:
+        vals = tuple(v.strip().lower() for v in raw.split(",") if v.strip())
+        if vals:
+            return frozenset(vals)
+    return frozenset(_DEFAULT_COSMETIC_WORK_NATURES)
+
+
 def score_signal(
     signal_source: str,
     target_files: Sequence[Any],
@@ -82,6 +104,23 @@ def score_signal(
         if str(_att.get("status", "")).strip().lower() == "resolved":
             return BAND_ORACLE
     except Exception:  # noqa: BLE001 — malformed evidence is not an oracle
+        _ev = {}
+
+    # ---- Declared work-nature: the signal knows what it will CHANGE --------
+    # The AST census below judges the TARGET FILE's content, which cannot tell
+    # "an op that will edit executable code" from "an op that targets executable
+    # code but only rewrites a docstring". A doc-staleness / comment / style
+    # signal is COSMETIC no matter that its target module parses and contains
+    # statements — the change never touches one. The signal declares this in its
+    # own evidence (the sensor stamps ``work_nature``); honoring it is the fix
+    # for the class where documentation churn scored EXECUTABLE and buried real
+    # work in the queue. Never overrides the oracle (a resolved failing-test
+    # attribution outranks any declared nature). Env-tunable, never raises.
+    try:
+        _wn = str((_ev or {}).get("work_nature", "") or "").strip().lower()
+        if _wn and _wn in _cosmetic_work_natures():
+            return BAND_COSMETIC_CLASS
+    except Exception:  # noqa: BLE001 — a bad marker is not authority
         pass
 
     # ---- AST census over the targets (the T2 engine — mandate 3) ---------

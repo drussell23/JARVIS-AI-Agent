@@ -10,9 +10,11 @@ that already knows the difference is consulted at ROUTE/GATE but never here.
 This composes that band into the base with the ROUTE layer's escalate/clamp
 semantics: a proven-defect (oracle) OR explicit-urgent signal escalates out of
 starvation; an un-urgent cosmetic signal clamps below substance; executable /
-indeterminate leaves the source tier alone. Shadow-first: master default-ON
-computes + stashes the band for the P0.5 soak, shadow default-ON means it is
-NOT yet applied (byte-identical order) until graduation flips shadow off.
+indeterminate leaves the source tier alone. GRADUATED 2026-09-06: master
+default-ON computes + stashes the band, and shadow now defaults OFF so the
+re-anchoring is APPLIED — substance sets queue order. Shadow mode stays
+available as an explicit opt-in (the `shadow` fixture sets it) and a typo can
+only fall back to shadow, never silently un-graduate into an unexpected state.
 """
 from __future__ import annotations
 
@@ -50,9 +52,12 @@ def enforce(monkeypatch):
 
 @pytest.fixture
 def shadow(monkeypatch):
-    """The graduated DEFAULT: master on, shadow on → compute but don't apply."""
+    """Explicit shadow: master on, shadow EXPLICITLY on → compute but don't
+    apply. As of the 2026-09-06 graduation the layer ENFORCES by default, so
+    shadow mode is now opt-in and this fixture must set it rather than rely on
+    the default (which is now enforce)."""
     monkeypatch.setenv("JARVIS_INTAKE_VALUE_PRIORITY_ENABLED", "true")
-    monkeypatch.delenv("JARVIS_INTAKE_VALUE_PRIORITY_SHADOW", raising=False)
+    monkeypatch.setenv("JARVIS_INTAKE_VALUE_PRIORITY_SHADOW", "true")
     monkeypatch.setenv("JARVIS_SIGNAL_VALUE_ROUTING_ENABLED", "true")
 
 

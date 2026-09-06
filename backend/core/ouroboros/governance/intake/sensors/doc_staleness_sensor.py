@@ -499,6 +499,13 @@ class DocStalenessSensor:
                     confidence=0.80,
                     urgency=finding.severity,
                     evidence={
+                        # This sensor's work is documentation ONLY — it rewrites
+                        # docstrings/READMEs, never an executable statement. The
+                        # value scorer reads this to classify the signal COSMETIC
+                        # even though the target module parses as executable code,
+                        # so documentation churn can no longer score EXECUTABLE
+                        # and bury real work at the front of the queue.
+                        "work_nature": "documentation",
                         "category": finding.category,
                         "public_symbols": finding.public_symbols,
                         "documented_symbols": finding.documented_symbols,

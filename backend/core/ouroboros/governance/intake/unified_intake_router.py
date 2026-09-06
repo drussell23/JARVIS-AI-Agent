@@ -611,10 +611,22 @@ def _value_priority_master_enabled() -> bool:
 
 
 def _value_priority_shadow_enabled() -> bool:
-    """Shadow (compute, don't apply). Default TRUE; ONLY an explicit off
-    un-shadows — a typo can never silently make value re-ranking authoritative."""
+    """Shadow (compute, don't apply).
+
+    GRADUATED 2026-09-06 — default flipped to ENFORCE (shadow OFF): substance,
+    not source VOLUME, now sets queue order. This is the root fix for the
+    autonomous-work-selection pathology where documentation churn (the highest-
+    VOLUME source) buried genuinely valuable work — a signal's value band, once
+    it correctly reflects work-nature (see ``signal_value.score_signal``), sinks
+    cosmetic work to the starvation floor and floats an oracle-band failing-test
+    op to the front. Re-anchoring is PURE queue re-ordering — never fed to Iron
+    Gate / risk tier / policy / approval, and never drops a signal — so enforcing
+    changes only WHICH ready op runs first. Re-shadow explicitly with
+    ``JARVIS_INTAKE_VALUE_PRIORITY_SHADOW=true``; the master
+    (``JARVIS_INTAKE_VALUE_PRIORITY_ENABLED=false``) still disables the layer
+    entirely."""
     return os.environ.get(
-        _VALUE_PRIORITY_SHADOW_ENV, "true",
+        _VALUE_PRIORITY_SHADOW_ENV, "false",
     ).strip().lower() not in ("0", "false", "no", "off")
 
 

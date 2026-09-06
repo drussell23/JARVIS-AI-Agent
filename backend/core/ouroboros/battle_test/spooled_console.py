@@ -326,6 +326,16 @@ def _render_to_text(args: Any, kwargs: Any, *, width: int) -> str:
         buffer = io.StringIO()
         scratch = Console(file=buffer, width=width, no_color=True,
                           highlight=False, soft_wrap=True)
+        # The SAME theme the daemon's console carries. A renderable styled
+        # with a semantic token (the boot summary's Panel, ``border_style=
+        # "muted"``) renders locally and RAISED here, so it fell to the
+        # ``str(a)`` fallback below and the cockpit's backlog replayed
+        # ``<rich.panel.Panel object at 0x…>`` (measured 2026-09-06).
+        try:
+            from backend.core.ouroboros.ui import theme as _theme
+            _theme.ensure_theme(scratch)
+        except Exception:  # noqa: BLE001 — a theme fault must not lose the line
+            pass
         safe = {k: v for k, v in kwargs.items()
                 if k in ("sep", "end", "justify", "overflow", "markup",
                          "highlight", "emoji", "style")}

@@ -318,6 +318,30 @@ async def test_the_spooled_console_honours_mirror_false() -> None:
     assert seen == ["relayed"]
 
 
+@pytest.mark.asyncio
+async def test_a_token_styled_panel_relays_as_a_box_never_a_repr() -> None:
+    """The boot summary is a Panel whose border is a THEME token. The
+    daemon console is themed; the relay's scratch console was not, so the
+    render raised and the fallback shipped ``repr(panel)`` to every
+    cockpit's backlog. Measured 2026-09-06 on the wire."""
+    from rich.panel import Panel
+    from rich.text import Text
+    from backend.core.ouroboros.battle_test.spooled_console import (
+        make_spooled_console,
+    )
+    body = Text()
+    body.append("OUROBOROS + VENOM\n", style=theme.Token.HEADING.value)
+    panel = Panel(body, border_style=theme.Token.MUTED.value, expand=False)
+    seen = []
+    console, spooler = make_spooled_console(lambda s, t: seen.append(t))
+    spooler.start()
+    console.print(panel)
+    await spooler.flush()
+    await spooler.stop()
+    assert seen and "OUROBOROS + VENOM" in seen[0]
+    assert "Panel object" not in seen[0]
+
+
 def test_the_spooled_console_declares_the_seam() -> None:
     from backend.core.ouroboros.battle_test.spooled_console import (
         make_spooled_console,

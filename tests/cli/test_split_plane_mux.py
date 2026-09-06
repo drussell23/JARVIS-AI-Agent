@@ -128,11 +128,26 @@ def test_persona_host_line_present():
 
 
 def test_non_tty_degrades_to_legacy_pump():
-    src = _src()
-    assert "_can_run_split_plane" in src
-    body = src[src.index("def _can_run_split_plane"):][:800]
-    assert "sys.stdin.isatty()" in body
-    assert "_legacy_pump_loop" in src
+    """Asserted on the BEHAVIOUR, not on an 800-character window after the
+    `def`. The window measured how much prose sat between the name and the
+    call — the same defect the renderer test below already calls out — and
+    it broke the moment the TTY check moved into `cli.surface_probe`, where
+    it now sits beside the dependency check it must be distinguishable
+    from. What matters is unchanged: no terminal, no split plane.
+    """
+    from backend.core.ouroboros.cli import ov as O
+    from backend.core.ouroboros.cli import surface_probe as sp
+
+    piped = sp.probe_interactive_surface(stdin_isatty=False, required=())
+    assert not piped.ok
+    assert piped.kind == sp.ENVIRONMENT
+    assert not piped.is_fault, "a pipe is not a broken install"
+
+    real = sp.probe_interactive_surface(stdin_isatty=True, required=())
+    assert real.ok
+
+    assert isinstance(O._can_run_split_plane(), bool)
+    assert "_legacy_pump_loop" in _src()
 
 
 def test_line_renderer_resolves_stdout_dynamically():

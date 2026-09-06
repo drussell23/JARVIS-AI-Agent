@@ -1039,16 +1039,32 @@ def _liquidity_lines(providers: Any, *, any_exhausted: Any = None,
     return lines
 
 
+def _split_plane_verdict() -> Any:
+    """WHY the split plane can or cannot run — not merely whether.
+
+    This used to be a bare bool that returned False for a piped stdin and
+    for a missing `prompt_toolkit` alike. The two are not alike: the first
+    is how the operator invoked us and deserves a quiet degrade, the
+    second is a broken install and deserves a banner. Measured on a real
+    terminal, the operator got neither — the caller only announces
+    failures INSIDE the branch this gate guards, so returning False here
+    skipped `mount_breaker.announce` entirely and left a frozen crest with
+    no prompt and no explanation. See `cli.surface_probe`. NEVER raises.
+    """
+    from backend.core.ouroboros.cli.surface_probe import (  # noqa: PLC0415
+        probe_interactive_surface,
+    )
+    return probe_interactive_surface()
+
+
 def _can_run_split_plane() -> bool:
-    """Split-plane needs a real TTY on stdin AND prompt_toolkit — piped
-    / scripted attaches degrade to the legacy pump. NEVER raises."""
-    try:
-        if not sys.stdin.isatty():
-            return False
-        import prompt_toolkit  # noqa: F401
-        return True
-    except Exception:
-        return False
+    """Whether the split plane can run. NEVER raises.
+
+    Kept as a bool for every existing caller and test; the reason is
+    available through `_split_plane_verdict` for the one call site that
+    has to tell the two causes apart.
+    """
+    return bool(_split_plane_verdict())
 
 
 async def _reap_task(task: Any) -> None:
@@ -4658,7 +4674,40 @@ def run_attach(console: Any) -> int:
 
         try:
             _ran_cockpit = False
-            if _can_run_split_plane():
+            _surface = _split_plane_verdict()
+            if _surface.is_fault:
+                # A BROKEN INSTALL, said out loud, through the SAME seam a
+                # cockpit crash uses — one policy, one banner, one log file.
+                # Silence here is what produced "stuck on the loading page":
+                # the organism was healthy, the attach succeeded, and the
+                # operator sat in front of a frozen crest that never became
+                # a prompt because nothing could render one.
+                try:
+                    from backend.core.ouroboros.battle_test.mount_breaker import (
+                        announce,
+                    )
+                    announce(
+                        _surface.error, _surface.reason,
+                        emit=lambda text: console.print(
+                            text, markup=False, highlight=False,
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                # The remedy is the whole value of noticing. Printed
+                # separately from the banner so it survives even if the
+                # crash-log write failed.
+                try:
+                    console.print(f"⎿ to fix: {_surface.remedy}",
+                                  markup=False, highlight=False)
+                    ui.boot_warnings = [
+                        *getattr(ui, "boot_warnings", ()),
+                        f"cockpit degraded — {_surface.reason}. "
+                        f"Fix: {_surface.remedy}",
+                    ]
+                except Exception:  # noqa: BLE001
+                    pass
+            if _surface.ok:
                 # Style-Guide cockpit is the default interactive surface; ANY
                 # failure falls through to the proven split-plane loop (the
                 # cockpit can never brick the attach). Kill-switch:

@@ -140,7 +140,35 @@ verify:
 	else \
 	  echo "does NOT resolve in this shell: $$first"; \
 	  echo "  (a login shell may still see it — try: bash -lc 'command -v $$first')"; \
-	fi
+	fi; \
+	$(MAKE) --no-print-directory verify-surface
+
+# Resolving is not running. `ov` resolved perfectly on a box where the
+# interactive cockpit could not start, because `pip install -e . --no-deps`
+# installs no dependencies and nothing then checked that the cockpit's own
+# imports were satisfied. The operator got a frozen crest and no prompt.
+#
+# The interpreter probed is the one the ENTRY POINT resolves through, read
+# from its shebang — not `python3`, and not whatever venv happens to be
+# active. That distinction IS the bug: the package was importable in the
+# shell and missing from the venv `ov` actually runs in.
+#
+# Never fails the build. This target reports; the operator decides.
+.PHONY: verify-surface
+verify-surface:
+	@set -uo pipefail; \
+	first="$$(echo $(ENTRY_POINTS) | awk '{print $$1}')"; \
+	bin="$$(command -v $$first 2>/dev/null || true)"; \
+	if [ -z "$$bin" ]; then exit 0; fi; \
+	py="$$(head -1 "$$bin" | sed -n 's|^#!\(.*\)$$|\1|p' | awk '{print $$1}')"; \
+	if [ ! -x "$$py" ]; then py="$$(command -v python3 || true)"; fi; \
+	if [ -z "$$py" ]; then echo "cockpit: no interpreter to probe"; exit 0; fi; \
+	"$$py" -c "import sys; sys.path.insert(0, '.'); \
+from backend.core.ouroboros.cli.surface_probe import probe_interactive_surface as p; \
+v = p(stdin_isatty=True); \
+print('cockpit: ready' if v.ok else 'cockpit: NOT ready — ' + v.reason); \
+print('  fix: ' + v.remedy) if v.remedy else None" 2>/dev/null \
+	  || echo "cockpit: could not probe (is this the repo root?)"
 
 unlink:
 	@set -uo pipefail; \

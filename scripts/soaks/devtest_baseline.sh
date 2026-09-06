@@ -108,6 +108,19 @@ export JARVIS_VALIDATION_RESERVE_ENABLED=true
 # 65 tests that take ~57 s standalone and blew 180 s under the sandboxed
 # candidate tree (pytest-timeout thread dump, JSON report unparseable). The
 # timeout is a guard against a HUNG suite, not a budget for a slow one.
+# WHICH MODEL THE CONTROL MEASURES, named here rather than inherited.
+# This script used to take whatever `.env` pinned, which was fine while the
+# pin WAS the base model. The moment the operator repoints that pin at a
+# fine-tuned tag so a bare `ov` picks it up, an unpinned control would
+# silently start measuring the adapter against itself -- a baseline that
+# is its own candidate, and nothing in the output would say so.
+#
+# `:-` preserves an existing export, so devtest_candidate.sh (which exports
+# the candidate tag before invoking this script) still overrides it. Named
+# default, overridable, and never ambient.
+export JARVIS_LOCAL_MODEL_NAME="${JARVIS_LOCAL_MODEL_NAME:-${OV_BASELINE_MODEL:-qwen3-coder:30b}}"
+echo "[devtest] model under test: $JARVIS_LOCAL_MODEL_NAME"
+
 export JARVIS_TEST_TIMEOUT_S=600
 # L2 on the local lane cannot re-emit providers.py (521 KB): the 2026-09-05
 # baseline got 30-32 KB back, twice, and died full_content_too_short. This

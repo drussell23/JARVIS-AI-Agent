@@ -313,6 +313,23 @@ def test_the_master_switch_restores_deck_only_routing(monkeypatch) -> None:
     assert rendered == [] and len(decked) == 1
 
 
+@pytest.mark.parametrize("line", [
+    "   [cyan]⏺ Read[/cyan]([cyan underline]backend/x.py[/cyan underline])  [dim]11ms[/dim]",
+    "   [cyan]⏺ Search[/cyan]([cyan underline]\"_check_api_keys_or_die\"[/cyan underline])  [dim]281ms[/dim]",
+    "   [dim]  ⎿  212 lines read[/dim]",
+    "   [cyan]⏺ Read[/cyan]([cyan underline]x.py[/cyan underline])  [dim]12ms[/dim]  [red]✗[/red]",
+])
+def test_a_composed_tool_block_lands_in_the_transcript(monkeypatch, line) -> None:
+    """The exact styled shapes the daemon now broadcasts for a tool call
+    (captured off the socket 2026-09-06). They must classify as WORK, not
+    agora, and take the same route the intent lines take -- the canvas --
+    or the daemon-side fix would be invisible at the one place it matters."""
+    sink, rendered, decked = _sink_with(monkeypatch, canvas_present=True)
+    sink(line, False)
+    assert rendered == [line]
+    assert decked == [line]
+
+
 def test_a_routing_fault_never_breaks_attach(monkeypatch) -> None:
     from backend.core.ouroboros.battle_test import ambient_deck as ad
     sink, rendered, decked = _sink_with(monkeypatch, canvas_present=True)

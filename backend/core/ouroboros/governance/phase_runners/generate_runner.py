@@ -1095,6 +1095,22 @@ class GENERATERunner(PhaseRunner):
                 except Exception:
                     pass
 
+                # ── LEDGER-SEAM STATE BINDING (root-cause, DRY) ──
+                # The generation carries its tool-execution records
+                # (provider.with_tool_records). Every terminal path BELOW
+                # (noop break, forward-progress, productivity, iron-gate,
+                # exhaustion) records the ledger with `ctx`, and the
+                # orchestrator's terminal seam then synthesises the op recap
+                # from `ctx.generation`. Those advances did not carry the
+                # generation, so `ctx.generation` reached the seam as None and
+                # the recap's tool count was silently zero. Bind it to ctx
+                # HERE, once, the moment it is finalised — the SAME late-bind
+                # idiom the route already uses (`object.__setattr__(ctx,
+                # "provider_route", …)`), so `dataclasses.replace` in every
+                # subsequent advance carries it immutably to the seam. No
+                # per-branch `generation=` to forget, no secondary cache.
+                if generation is not None:
+                    object.__setattr__(ctx, "generation", generation)
                 # is_noop=True means the model signalled the change is already present.
                 # Empty candidates is correct in this case — do not treat as a failure.
                 if generation is not None and generation.is_noop:

@@ -161,3 +161,42 @@ def test_the_terminal_seam_supplies_the_recap_counts():
     src = inspect.getsource(om.GovernedOrchestrator._emit_terminal_decision)
     assert "tools_used=_tools" in src and "tokens=_tokens" in src
     assert "tool_count" in src and "output_tokens" in src
+
+
+# ---------------------------------------------------------------------------
+# Ledger-seam binding — the generation (with its tool records) reaches the
+# terminal seam on EVERY path, not only a full apply.
+# ---------------------------------------------------------------------------
+
+
+def test_the_runner_binds_the_generation_to_ctx_before_the_terminal_ledger():
+    """Root cause of the zero tool counts: terminal paths recorded the ledger
+    with ctx.generation unbound. The runner now binds it the moment the
+    generation is finalised, so dataclasses.replace carries its
+    tool_execution_records through every advance to the recap seam."""
+    import inspect
+    from backend.core.ouroboros.governance.phase_runners import generate_runner as gr
+    src = inspect.getsource(gr)
+    assert 'object.__setattr__(ctx, "generation", generation)' in src
+    # Bound right after the generation is finalised, and BEFORE the
+    # post-generation noop break that follows it — so the real noop terminal
+    # (the model exploring then declining) carries the records. (The FIRST
+    # noop check in the file is the synthetic wiring-validation fixture path,
+    # which legitimately ran zero tools.)
+    i = src.index('object.__setattr__(ctx, "generation", generation)')
+    j = src.index("if generation is not None and generation.is_noop:", i)
+    assert 0 < i < j
+
+
+def test_a_noop_generation_still_carries_its_tool_records_to_the_recap():
+    """A noop op that explored (ran tools) must recap the exploration effort,
+    not report zero — the desync this fixes."""
+    from types import SimpleNamespace
+    gen = SimpleNamespace(is_noop=True, noop_reason="already covered",
+                          tool_execution_records=(1, 2, 3, 4),
+                          total_output_tokens=147, venom_edit_history=())
+    assert r.tool_count(gen) == 4 and r.output_tokens(gen) == 147
+    line = r.compose_recap(elapsed="1m 3s", verb="Reviewed",
+                           tools=r.tool_count(gen), tokens=r.output_tokens(gen),
+                           done_at="2:15 PM")
+    assert "4 tools used" in line and "↑ 147 tokens" in line

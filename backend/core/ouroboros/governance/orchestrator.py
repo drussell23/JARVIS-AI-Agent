@@ -11716,27 +11716,93 @@ class GovernedOrchestrator:
                     _in_tok = getattr(_gen, "total_input_tokens", 0) or 0
                     _out_tok = getattr(_gen, "total_output_tokens", 0) or 0
                     _cost = (_in_tok * 0.0000001 + _out_tok * 0.0000004)  # rough estimate
+                # ---- Phase 3: pre-commit structural-AST no-op guard ----
+                # Anti-Venom Vector 1 scaled to the live APPLY boundary. Before
+                # the committer runs, PROVE whether the applied change is a pure
+                # whitespace/comment no-op vs HEAD (literals + docstrings are
+                # content and count as change). If every target file is
+                # structurally identical, the "fix" added nothing executable — a
+                # Quine-class hallucination or formatting churn. Fail-closed:
+                # abort the commit cleanly, revert the churn (recoverable stash),
+                # and emit a non-blocking diff_rejection. The guard NEVER raises
+                # and only ever suppresses a change it has PROVEN is empty.
+                _precommit_noop = False
+                try:
+                    from backend.core.ouroboros.governance.precommit_ast_guard import (  # noqa: E501
+                        check_precommit_structural_noop,
+                    )
+                    _noop_verdict = await check_precommit_structural_noop(
+                        self._config.project_root, ctx.target_files,
+                    )
+                    if _noop_verdict.is_noop:
+                        _precommit_noop = True
+                        _commit_skip_reason = "precommit_ast_noop"
+                        logger.info(
+                            "[Orchestrator] Pre-commit AST guard: op=%s is a "
+                            "structural no-op (%d/%d files) — aborting commit",
+                            ctx.op_id, _noop_verdict.files_matched,
+                            _noop_verdict.files_checked,
+                        )
+                        # Revert the proven-empty churn so it never pollutes the
+                        # tree (recoverable stash — never a destructive reset).
+                        try:
+                            from backend.core.ouroboros.governance.commit_fault_recovery import (  # noqa: E501
+                                stash_workspace,
+                                emit_diff_rejection,
+                            )
+                            _stashed, _stash_ref = await stash_workspace(
+                                self._config.project_root,
+                                list(ctx.target_files or ()),
+                                ctx.op_id,
+                            )
+                            emit_diff_rejection(
+                                ctx.op_id, "precommit_ast_noop",
+                                _noop_verdict.reason,
+                                tuple(ctx.target_files or ()),
+                                stashed=_stashed, stash_ref=_stash_ref,
+                            )
+                        except Exception:  # noqa: BLE001 — cleanup is best-effort
+                            logger.debug(
+                                "[Orchestrator] no-op churn revert degraded",
+                                exc_info=True,
+                            )
+                        await self._record_ledger(
+                            ctx, OperationState.APPLYING,
+                            {"event": "precommit_ast_noop_abort",
+                             **_noop_verdict.to_dict()},
+                        )
+                except Exception:  # noqa: BLE001 — guard fault never blocks commit
+                    logger.debug(
+                        "[Orchestrator] pre-commit AST guard degraded — "
+                        "allowing commit", exc_info=True,
+                    )
                 # LR-B (spec 5.4): the git commit is a critical mutation —
                 # an in-progress commit must not be parked by the
-                # operator-yield (no-op when the yield is off).
-                async with maybe_mutation_section(ctx.op_id):
-                    _commit_result = await asyncio.wait_for(
-                        _committer.commit(
-                            op_id=ctx.op_id,
-                            description=ctx.description,
-                            target_files=ctx.target_files,
-                            risk_tier=ctx.risk_tier,
-                            provider_name=_provider,
-                            generation_cost=_cost,
-                            # Mythos §7.4: originating signal + rationale for
-                            # zero-context reviewers.
-                            signal_source=getattr(ctx, "signal_source", ""),
-                            signal_urgency=getattr(ctx, "signal_urgency", ""),
-                            rationale=ctx.description,
-                        ),
-                        timeout=30.0,
-                    )
-                if _commit_result.committed:
+                # operator-yield (no-op when the yield is off). A proven
+                # structural no-op skips the committer ENTIRELY — a clean abort,
+                # NOT a fault: it must not reach the commit-fault recovery path.
+                _commit_result = None
+                if not _precommit_noop:
+                    async with maybe_mutation_section(ctx.op_id):
+                        _commit_result = await asyncio.wait_for(
+                            _committer.commit(
+                                op_id=ctx.op_id,
+                                description=ctx.description,
+                                target_files=ctx.target_files,
+                                risk_tier=ctx.risk_tier,
+                                provider_name=_provider,
+                                generation_cost=_cost,
+                                # Mythos §7.4: originating signal + rationale for
+                                # zero-context reviewers.
+                                signal_source=getattr(ctx, "signal_source", ""),
+                                signal_urgency=getattr(ctx, "signal_urgency", ""),
+                                rationale=ctx.description,
+                            ),
+                            timeout=30.0,
+                        )
+                if _precommit_noop:
+                    pass  # abort already recorded by the Phase 3 guard above
+                elif _commit_result is not None and _commit_result.committed:
                     _committed_hash = _commit_result.commit_hash
                     try:
                         await self._stack.comm.emit_heartbeat(

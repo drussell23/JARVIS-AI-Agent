@@ -89,12 +89,94 @@ def _probe_timeout_s() -> float:
     return max(0.05, min(3.0, raw))
 
 
+#: How much longer than a typical boot we are willing to wait before saying
+#: it did not come up. 3x, because the estimator's input is a MEDIAN: half
+#: of all boots are slower than it by construction, and a cold cache, a
+#: model load and 22 sensors arming make the tail long.
+_BOOT_WAIT_TOLERANCE = 3.0
+#: Never wait less than this, whatever the history claims. A ledger holding
+#: only fast samples must not be able to produce a window too short for any
+#: real boot to finish in.
+_BOOT_WAIT_FLOOR_S = 120.0
+
+
 def _boot_wait_s() -> float:
+    """How long to wait for a cold boot, DERIVED from observed boots.
+
+    This was the constant 120. Measured 2026-09-05: a cold boot was still
+    wiring the cockpit at 114s and the client gave up at 120, printing "the
+    organism did not come up" about an organism that came up fine seconds
+    later — the operator sees a failure, the daemon is healthy, and nothing
+    connects the two.
+
+    A fixed number cannot be right on both a warm laptop and a box loading
+    an 18 GB model, so it is derived from the operator's own boots — the
+    same pattern `expected_boot_s` already uses for the progress estimate,
+    and `session_economics.derived_cost_cap` uses for money. The explicit
+    env var still wins, for a box that knows better than its history.
+    """
+    raw = (os.environ.get("JARVIS_OV_BOOT_WAIT_S", "") or "").strip()
+    if raw:
+        try:
+            return max(5.0, min(900.0, float(raw)))
+        except (TypeError, ValueError):
+            pass
+    observed = None
     try:
-        raw = float(os.environ.get("JARVIS_OV_BOOT_WAIT_S", "120"))
-    except (TypeError, ValueError):
-        raw = 120.0
-    return max(5.0, min(900.0, raw))
+        from backend.core.ouroboros.cli import boot_progress as _bp  # noqa: PLC0415
+
+        observed = _bp.expected_boot_s()
+    except Exception:  # noqa: BLE001 — no history is not a failure
+        observed = None
+    if observed and observed > 0:
+        return max(_BOOT_WAIT_FLOOR_S,
+                   min(900.0, observed * _BOOT_WAIT_TOLERANCE))
+    return _BOOT_WAIT_FLOOR_S
+
+
+#: How many stall windows a boot may take in TOTAL. The stall window says
+#: how long silence is tolerated; this says how long the whole thing may
+#: run even while it keeps talking. 4x.
+_BOOT_CEILING_MULTIPLE = 4.0
+
+
+def _boot_ceiling_s(stall_s: Optional[float] = None) -> float:
+    """The absolute cap on a boot wait — deliberately BLIND to progress.
+
+    The stall window below can be renewed by the daemon writing to its log,
+    which is exactly what makes it honest about a slow boot. It is also
+    what would make it unbounded if a boot could spin while logging: a
+    wait that a live process can extend forever is not a bound.
+
+    So the pair is: a renewable stall window that decides "is it still
+    working", and this static ceiling that decides "has it had long
+    enough", answered from the clock alone. Nothing the daemon does moves
+    it. That is the same separation the harness keeps between its idle
+    timeout and `--max-wall-seconds`, and for the same reason — a bound
+    that shares a signal with the thing it bounds is not a bound.
+    """
+    raw = (os.environ.get("JARVIS_OV_BOOT_CEILING_S", "") or "").strip()
+    if raw:
+        try:
+            return max(5.0, min(3600.0, float(raw)))
+        except (TypeError, ValueError):
+            pass
+    base = stall_s if stall_s is not None else _boot_wait_s()
+    return max(base, min(3600.0, base * _BOOT_CEILING_MULTIPLE))
+
+
+def _boot_log_mark() -> int:
+    """Bytes the daemon has written so far — a cheap, monotonic proof of
+    work. Size ONLY: the wait must never parse or interpret what the boot
+    says about itself, or a daemon that lies in its log could talk its way
+    past its own deadline. -1 when unreadable, which reads as no progress
+    and therefore never extends anything. NEVER raises."""
+    try:
+        from backend.core.ouroboros.cli import boot_progress as _bp  # noqa: PLC0415
+
+        return int(_bp.log_size(str(daemon_log_path())))
+    except Exception:  # noqa: BLE001
+        return -1
 
 
 # ---------------------------------------------------------------------------
@@ -497,13 +579,44 @@ async def await_socket(
     full-deadline vigil over a corpse (the 117s-wait class; a
     single-flight rejection exits within ~2s of ignition).
 
+    The wait ends on SILENCE, not on elapsed time. Measured 2026-09-05: a
+    cold boot was still wiring the cockpit at 114s against a fixed 120s
+    window, and the client was about to report "the organism did not come
+    up" about an organism that came up fine. Raising the constant only
+    moves the cliff, and the estimator cannot learn its way out — a boot
+    slow enough to be abandoned records no duration, so the history keeps
+    only the fast ones and keeps predicting them. The signal that
+    distinguishes a slow boot from a dead one is not the clock, it is
+    whether the daemon is still writing: `stall_s` of no growth in its log
+    AND no live socket ends the wait, while growth renews it, up to a
+    `ceiling_s` that no amount of progress can move.
+
     ``on_tick(elapsed)`` drives the waking breadcrumb. NEVER raises."""
-    deadline = deadline_s if deadline_s is not None else _boot_wait_s()
+    stall = deadline_s if deadline_s is not None else _boot_wait_s()
+    hard_deadline = _boot_ceiling_s(stall)
     start = time.monotonic()
+    last_advance = start
+    mark = _boot_log_mark()
     delay = _backoff_min_s()
     ceiling = max(_backoff_max_s(), delay)
     try:
-        while (time.monotonic() - start) < deadline:
+        while True:
+            now = time.monotonic()
+            if (now - start) >= hard_deadline:
+                break
+            moved = _boot_log_mark()
+            if moved >= 0 and moved != mark:
+                # It is still working. The silence clock restarts; the
+                # ceiling above does not.
+                #
+                # ANY change, not just growth: a fresh boot may truncate or
+                # rotate the previous session's log, and a shrink read as
+                # "no progress" would strand a starting daemon behind the
+                # byte count of the run before it.
+                mark = moved
+                last_advance = now
+            if (now - last_advance) >= stall:
+                break
             bound = min(3.0, max(_probe_timeout_s(), delay))
             if await probe_socket(path, timeout=bound, deep=True) == "live":
                 # Closed HERE rather than at each of the four call sites —
@@ -536,7 +649,11 @@ async def await_socket(
                     on_tick(time.monotonic() - start)
                 except Exception:  # noqa: BLE001
                     pass
-            remaining = deadline - (time.monotonic() - start)
+            # Sleep no further than the SOONER of the two bounds, so a
+            # long backoff cannot overshoot either one.
+            now = time.monotonic()
+            remaining = min(hard_deadline - (now - start),
+                            stall - (now - last_advance))
             if remaining <= 0:
                 break
             sleep_for = min(random.uniform(_backoff_min_s(), delay), remaining)

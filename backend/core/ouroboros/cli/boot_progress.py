@@ -65,6 +65,9 @@ CEILING_ENV = "JARVIS_OV_BOOT_PROGRESS_CEILING"
 #: How far past its own prediction a boot may run before the line says so.
 OVERRUN_TOLERANCE_ENV = "JARVIS_OV_BOOT_OVERRUN_TOLERANCE"
 OVERRUN_GRACE_ENV = "JARVIS_OV_BOOT_OVERRUN_GRACE_S"
+#: The shortest duration that may be called a boot. Below it, the sample is
+#: an ATTACH to an organism that was already up.
+MIN_BOOT_ENV = "JARVIS_OV_MIN_BOOT_S"
 
 _TRUTHY = ("1", "true", "yes", "on")
 _DEFAULT_HISTORY = os.path.join(".jarvis", "boot_durations.json")
@@ -181,16 +184,45 @@ DEFAULT_STAGES: Tuple[BootStage, ...] = (
 )
 
 
+def min_boot_s() -> float:
+    """The shortest duration that can honestly be called a boot.
+
+    A real boot imports the stack, binds a socket, opens a session and arms
+    the sensor set; none of that happens in under a second on any hardware.
+    A sub-second sample is therefore an ATTACH to an organism that was
+    already running, and counting it as a boot teaches the estimator that
+    booting is instant. Default 2.0 — an order of magnitude above the
+    observed attach cost and an order below the observed boot cost, so the
+    separation does not depend on tuning. Tunable because the floor is a
+    claim about THIS machine, not a law.
+    """
+    try:
+        v = float(os.environ.get(MIN_BOOT_ENV, "2.0"))
+        return v if v > 0 else 2.0
+    except (TypeError, ValueError):
+        return 2.0
+
+
 def observed_boot_durations(path: Optional[str] = None) -> List[float]:
-    """Durations of past successful boots, seconds. NEVER raises."""
+    """Durations of past successful boots, seconds. NEVER raises.
+
+    The floor is applied HERE as well as at the write, because a guard on
+    the write only protects a ledger written after the guard shipped. The
+    contaminated rows are already on disk, and every consumer reads through
+    this function — so filtering here heals the existing history without
+    rewriting the operator's file behind their back. A row below the floor
+    is not deleted, it is simply not counted as a boot, and the next
+    successful write drops it out of the retained window on its own.
+    """
     try:
         p = path or history_path()
         if not os.path.exists(p):
             return []
         with open(p, encoding="utf-8") as fh:
             data = json.load(fh)
+        floor = min_boot_s()
         out = [float(x) for x in (data.get("durations") or [])
-               if isinstance(x, (int, float)) and 0.0 < float(x) < 3600.0]
+               if isinstance(x, (int, float)) and floor < float(x) < 3600.0]
         return out
     except Exception:  # noqa: BLE001
         return []
@@ -204,7 +236,15 @@ def record_boot_duration(seconds: float, path: Optional[str] = None) -> None:
     operator's patience, which is the number it exists to replace.
     """
     try:
-        if not (0.0 < float(seconds) < 3600.0):
+        if not (min_boot_s() < float(seconds) < 3600.0):
+            # Below the floor this was an ATTACH, not a boot. Observed
+            # 2026-09-05, the ledger held [33.9, 0.10, 32.2, 0.10]: half the
+            # samples were sub-second connections to an organism that was
+            # ALREADY running, recorded as though the whole boot had taken
+            # a tenth of a second. They drag the median toward zero, and
+            # because only the last `max_samples()` are kept, a few attaches
+            # can evict every genuine boot from the history the estimator
+            # and the wait window both read.
             return
         p = path or history_path()
         rows = observed_boot_durations(p)

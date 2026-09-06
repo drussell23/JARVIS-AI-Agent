@@ -326,6 +326,48 @@ class NarrativeChannel:
         self._active_keys: Dict[Tuple[str, str, str], str] = {}
         self._next_seq: int = 1
         self._lock = threading.RLock()
+        # Commit subscribers. The channel is a RING the operator pages back
+        # through; a surface that wants to show a frame AS IT LANDS needs a
+        # signal, and until this existed each surface had to find and
+        # render frames by hand -- which is why the default transport
+        # rendered none of them. Notified OUTSIDE the lock, one listener's
+        # fault isolated from the next. Deduplicated by EQUALITY: a bound
+        # method is a new object on every attribute access, so identity
+        # would let the same subscriber in twice and never let it out.
+        self._commit_listeners: list = []
+
+    # ---- commit subscribers --------------------------------------------
+
+    def add_commit_listener(self, fn: object) -> bool:
+        """Subscribe ``fn(frame)`` to every frame that COMMITS (including
+        ``emit_complete``). Returns ``True`` when newly added. NEVER raises."""
+        if not callable(fn):
+            return False
+        with self._lock:
+            if any(existing == fn for existing in self._commit_listeners):
+                return False
+            self._commit_listeners.append(fn)
+        return True
+
+    def remove_commit_listener(self, fn: object) -> bool:
+        """Unsubscribe; ``True`` when it was subscribed. NEVER raises."""
+        with self._lock:
+            for i, existing in enumerate(self._commit_listeners):
+                if existing == fn:
+                    del self._commit_listeners[i]
+                    return True
+        return False
+
+    def _notify_commit(self, frame: NarrativeFrame) -> None:
+        with self._lock:
+            listeners = tuple(self._commit_listeners)
+        for fn in listeners:
+            try:
+                fn(frame)
+            except Exception:  # noqa: BLE001 -- one listener never silences another
+                logger.debug(
+                    "[NarrativeChannel] commit listener raised", exc_info=True,
+                )
 
     # ---- introspection -----------------------------------------------
 
@@ -478,7 +520,8 @@ class NarrativeChannel:
                 terminal_at=time.monotonic(),
             )
             self._items[ref] = updated
-            return updated
+        self._notify_commit(updated)
+        return updated
 
     def discard(
         self,

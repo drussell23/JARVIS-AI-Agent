@@ -350,6 +350,7 @@ _GLYPHS: Mapping[str, tuple] = {
     "cross": ("✗", "X"),    # failed
     "arrow": ("›", ">"),    # prompt / pointer
     "rule": ("─", "-"),     # hairline
+    "ellipsis": ("…", "..."),  # a clipped line, cut at a word (§3, never mid-word)
     # Design-language semantic ration (OV_DESIGN_LANGUAGE.md §2) —
     # the SIX operator-plane glyphs, each with an ASCII degradation
     # so 16-color/none terminals keep identical geometry.

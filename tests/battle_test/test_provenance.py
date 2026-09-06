@@ -232,11 +232,19 @@ class TestTheWiredProducers:
         src = pathlib.Path(
             "backend/core/ouroboros/battle_test/narrative_renderer.py"
         ).read_text()
+        # The surfacing seam is `render_to_printer`; `render_to_console`
+        # is the console-shaped wrapper over it (the default transport
+        # renders through the printer seam with its own sink).
         fn = next(n for n in ast.walk(ast.parse(src))
                   if isinstance(n, ast.FunctionDef)
-                  and n.name == "render_to_console")
+                  and n.name == "render_to_printer")
         assert "claiming" in {ast.unparse(n.func) for n in ast.walk(fn)
                               if isinstance(n, ast.Call)}
+        wrapper = next(n for n in ast.walk(ast.parse(src))
+                       if isinstance(n, ast.FunctionDef)
+                       and n.name == "render_to_console")
+        assert "render_to_printer" in {ast.unparse(n.func) for n in ast.walk(wrapper)
+                                       if isinstance(n, ast.Call)}
 
     def test_the_synthesized_preamble_declares_itself(self):
         """The demonstration case: a template the code filled in, currently

@@ -22,15 +22,26 @@ Architectural pillars:
      producer-side changes required. The transport IS the rendering
      surface.
   2. **One line per op transition** — INTENT prints a single
-     ``· <Sensor>(<short_id>) <summary>`` line; DECISION prints
-     ``✓ <Sensor>(<short_id>) done in Xs`` (success) or
-     ``✗ <Sensor>(<short_id>) shed: <reason> (Xs)`` (failure). No
-     per-phase emoji cascade; no multi-line block per op.
-  3. **Bullet markers from a closed taxonomy** —
-     :class:`OpStatusGlyph`. ``·`` (active), ``●`` (running with
-     work), ``✓`` (done), ``✗`` (failed), ``◌`` (cancelled),
-     ``⏭`` (no-op). AST-pinned. Adding a glyph requires coordinated
-     update.
+     ``⏺ <Sensor> · <summary>`` line; DECISION prints
+     ``✓ <Sensor> · <summary> · Xs`` (success), ``✗ … · shed: <reason>``
+     (failure) or ``⎿ … · no change`` with the model's own reason
+     beneath. No per-phase emoji cascade; no multi-line block per op;
+     no truncated ids (OV_DESIGN_LANGUAGE §3 — a hash earns its place
+     only as an ``/expand``-able ref, and these are not).
+  3. **Status marks from a closed taxonomy** — :class:`OpStatusGlyph`,
+     six STATUSES whose marks are NAMES in the design-language ration
+     (``theme.mark``): one glyph table for every surface, one ASCII
+     degradation. AST-pinned on the member names.
+  3b. **The organism narrates** (2026-09-06) — this transport is the
+     default renderer, and until now it was the one surface with no
+     voice: the 💭 intent SerpentFlow requests on ``op_started`` and the
+     🗣 preamble it prints on ``op_tool_start`` are SerpentFlow methods,
+     which the default mode never calls. The transport now uses the SAME
+     producers (``intent_prompter``, ``tool_preamble_synthesizer``) and
+     renders every frame that commits to the ``NarrativeChannel`` through
+     the same renderer, so plan prose, repair prose and postmortems
+     arrive too — one subscription, one seam (``_safe_print``), mirrored
+     to every attached cockpit.
   4. **Boot-recovery suppression preserved** — same logic as
      SerpentTransport: the first ``boot_recovery_*`` reason starts
      a counter; subsequent ones increment; on first non-recovery
@@ -74,12 +85,16 @@ Kill switches:
 """
 from __future__ import annotations
 
+import asyncio
 import enum
 import logging
+import textwrap
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
+from backend.core.ouroboros.ui import theme as _theme
 from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
     role_palette as _role_palette,
 )
@@ -96,6 +111,18 @@ CLAUDE_STYLE_TRANSPORT_SCHEMA_VERSION: str = "claude_style_transport.1"
 
 _FLAG_RENDER_MODE = "JARVIS_RENDER_MODE"
 _FLAG_CLAUDE_SHOW_HEARTBEATS = "JARVIS_CLAUDE_STYLE_SHOW_HEARTBEATS"
+#: Characters of goal summary on an op line, and the wrap width of the
+#: organism's narration beneath it. One budget, so the block reads as one.
+_FLAG_LINE_CHARS = "JARVIS_CLAUDE_STYLE_LINE_CHARS"
+_DEFAULT_LINE_CHARS = 72
+_MIN_LINE_CHARS = 24
+#: Lines of the model's own words shown under an outcome before the rest
+#: is elided (OV_DESIGN_LANGUAGE §5: past ~8 lines it wants an /expand).
+_FLAG_DETAIL_LINES = "JARVIS_CLAUDE_STYLE_DETAIL_LINES"
+_DEFAULT_DETAIL_LINES = 3
+#: Bound on remembered (op, round) preamble keys — a memory bound, not a
+#: behaviour; the same figure SerpentFlow keeps for the same dedup.
+_PREAMBLE_MEMORY = 512
 
 
 # ---------------------------------------------------------------------------
@@ -119,16 +146,40 @@ class RenderMode(str, enum.Enum):
     SERPENT = "SERPENT"
 
 
-class OpStatusGlyph(str, enum.Enum):
-    """Closed taxonomy of per-op status bullets. Matches Claude
-    Code's restraint: 6 bullets total, each with semantic meaning."""
+class OpStatusGlyph(enum.Enum):
+    """Closed taxonomy of per-op status marks — six STATUSES.
 
-    ACTIVE = "·"        # op in flight (just sensed; not yet routing)
-    RUNNING = "●"       # op actively running (synthesizing / verifying)
-    DONE = "✓"          # op completed successfully
-    FAILED = "✗"        # op shed (failed)
-    CANCELLED = "◌"     # op cancelled mid-flight
-    NOOP = "⏭"          # triage NO_OP — op was unnecessary
+    Each value is ``(mark, colour role, status)``. The mark is a NAME in
+    the design-language ration (``theme.mark``), so this transport draws
+    from the same six-glyph table as every other surface and degrades to
+    ASCII with it; the colour role is a name in the semantic palette. Two
+    statuses may share a mark — outcomes are told apart by colour and copy
+    (OV_DESIGN_LANGUAGE §3.4), never by inventing a seventh glyph. Before
+    this the transport kept bullets of its own (``· ● ◌ ⏭``): the middle
+    dot is the language's SEPARATOR, and the other three are outside the
+    ration, so the presentation router scrubbed them and the op lines read
+    as noise on the very surface that is the default."""
+
+    ACTIVE = ("action", "neural", "active")       # ⏺ an op begins
+    RUNNING = ("detail", "heal", "running")       # ⎿ a mid-op transition
+    DONE = ("check", "success", "done")           # ✓ typographic outcome
+    FAILED = ("cross", "death", "failed")         # ✗ typographic outcome
+    CANCELLED = ("detail", "dim", "cancelled")    # ⎿ ended without effect
+    NOOP = ("detail", "dim", "noop")              # ⎿ the model declined
+
+    @property
+    def mark(self) -> str:
+        return self.value[0]
+
+    @property
+    def role(self) -> str:
+        return self.value[1]
+
+    @property
+    def glyph(self) -> str:
+        """The rendered glyph, from the one theme table, for the terminal
+        that will display it."""
+        return _theme.mark(self.mark)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +223,26 @@ def show_heartbeats() -> bool:
     return reg.get_bool(_FLAG_CLAUDE_SHOW_HEARTBEATS, default=False)
 
 
+def _read_int_flag(name: str, default: int, floor: int) -> int:
+    reg = _get_registry()
+    if reg is None:
+        return default
+    try:
+        return max(floor, int(str(reg.get_str(name, default=str(default))).strip()))
+    except Exception:  # noqa: BLE001 — a typo in a knob never blanks a line
+        return default
+
+
+def line_chars() -> int:
+    """Goal-summary budget and narration wrap width (``JARVIS_CLAUDE_STYLE_LINE_CHARS``)."""
+    return _read_int_flag(_FLAG_LINE_CHARS, _DEFAULT_LINE_CHARS, _MIN_LINE_CHARS)
+
+
+def detail_lines() -> int:
+    """Lines of the model's words under an outcome (``JARVIS_CLAUDE_STYLE_DETAIL_LINES``)."""
+    return _read_int_flag(_FLAG_DETAIL_LINES, _DEFAULT_DETAIL_LINES, 1)
+
+
 # ---------------------------------------------------------------------------
 # Per-op state
 # ---------------------------------------------------------------------------
@@ -189,6 +260,7 @@ class _OpState:
     started_monotonic: float = field(default_factory=time.monotonic)
     risk_tier: str = ""
     target_files: tuple = ()
+    goal: str = ""         # the full goal — the intent prompt wants all of it
 
 
 def _short_id(op_id: str) -> str:
@@ -213,6 +285,48 @@ def _format_elapsed(started_monotonic: float) -> str:
     if elapsed < 3600:
         return f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
     return f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m"
+
+
+def _escape(s: object) -> str:
+    """Neutralise model-controlled text for Rich markup without importing
+    ``rich`` (an authority invariant of this module, AST-pinned). Escaping
+    every "[" is a strict superset of what ``rich.markup.escape`` does, so
+    no text can open a tag."""
+    return str(s).replace("[", "\\[")
+
+
+def _clip_words(text: object, limit: int) -> str:
+    """Cut prose to ``limit`` at a WORD boundary with the theme's ellipsis.
+    A cut mid-word ("graduati...") reads as a defect; a cut at a word with a
+    real ellipsis reads as a summary (OV_DESIGN_LANGUAGE §3)."""
+    s = " ".join(str(text or "").split())
+    if limit <= 0 or len(s) <= limit:
+        return s
+    ell = _theme.mark("ellipsis")
+    room = max(1, limit - len(ell))
+    cut = s[:room]
+    space = cut.rfind(" ")
+    if space >= room // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:.") + ell
+
+
+def _short_path(path: object, budget: int) -> str:
+    """``…/parent/file.py`` once a path outgrows its budget."""
+    p = str(path or "")
+    if len(p) <= budget:
+        return p
+    parts = [x for x in p.replace("\\", "/").split("/") if x]
+    if len(parts) < 2:
+        return p
+    return f"{_theme.mark('ellipsis')}/{'/'.join(parts[-2:])}"
+
+
+def _humanise(code: object) -> str:
+    """A reason CODE as words: ``background_dw_blocked`` → ``background dw
+    blocked``. The code is information; its spelling is a field name, and
+    the operator never sees a field name (§3.1)."""
+    return " ".join(str(code or "").strip().split("_")).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +375,13 @@ class ClaudeStyleTransport:
         # CC2.1 — running counters for TASK_LIST composer field
         self._done_count: int = 0
         self._failed_count: int = 0
+        # Narration. Intent requests run as tasks off the render path (a
+        # transport must never await a model); the set keeps them
+        # referenced until done. Preamble keys dedupe a parallel tool batch
+        # to one 🗣 line per (op, round), exactly as SerpentFlow does.
+        self._narration_tasks: Set[Any] = set()
+        self._preamble_keys: "OrderedDict[tuple, None]" = OrderedDict()
+        self._subscribe_narrative()
 
     # -- composer feed (CC2.1) --------------------------------------
 
@@ -341,12 +462,13 @@ class ClaudeStyleTransport:
         # Boot-recovery suppression (mirrors SerpentTransport).
         reason_code = str(payload.get("reason_code", "") or "")
         risk_tier = str(payload.get("risk_tier", "") or "")
+        sep = _theme.mark("dot")
         if reason_code.startswith("boot_recovery_"):
             self._boot_recovery_count += 1
             if self._boot_recovery_count == 1:
                 self._safe_print(
-                    "[dim]· boot recovery │ "
-                    "reconciling stale ledger entries...[/dim]"
+                    f"[dim]{_theme.mark('detail')} boot recovery {sep} "
+                    f"reconciling stale ledger entries{_theme.mark('ellipsis')}[/dim]"
                 )
             return
         if risk_tier == "routing":
@@ -356,47 +478,38 @@ class ClaudeStyleTransport:
         if self._boot_recovery_count > 0 and not self._boot_recovery_flushed:
             self._boot_recovery_flushed = True
             self._safe_print(
-                f"[dim]· boot recovery │ "
-                f"{self._boot_recovery_count} stale entries reconciled"
-                f"[/dim]"
+                f"[dim]{_theme.mark('detail')} boot recovery {sep} "
+                f"{self._boot_recovery_count} stale entries reconciled[/dim]"
             )
             self._safe_print("")
 
         sensor = self._infer_sensor(payload)
         summary = self._summarize(payload)
-        short = _short_id(op_id)
         state = _OpState(
             op_id=op_id,
-            short_id=short,
+            short_id=_short_id(op_id),
             sensor=sensor,
             summary=summary,
             risk_tier=str(payload.get("risk_tier", "") or "").upper(),
             target_files=tuple(payload.get("target_files", []) or []),
+            goal=str(payload.get("goal", "") or "").strip(),
         )
         self._op_state[op_id] = state
         # CC2.1 — feed composer with current ACTIVE_OP + TASK_LIST
         self._feed_composer()
-        # Render: `· <Sensor>(<short_id>) <summary>`
-        target_repr = ""
-        if state.target_files:
-            primary = state.target_files[0]
-            if isinstance(primary, str) and len(primary) > 50:
-                parts = primary.split("/")
-                primary = ".../" + "/".join(parts[-2:])
-            target_repr = f" [dim]{primary}[/dim]"
-        risk_repr = ""
+        # Render: `⏺ <Sensor> · <summary> [· risk] [path]`
+        tail = ""
         if state.risk_tier and state.risk_tier not in ("SAFE_AUTO", "LOW"):
-            color = (
-                "yellow" if state.risk_tier == "MEDIUM"
+            tone = (
+                "yellow" if state.risk_tier in ("MEDIUM", "NOTIFY_APPLY")
                 else "red"
             )
-            risk_repr = f" [[{color}]{state.risk_tier}[/{color}]]"
-        self._safe_print(
-            f"{OpStatusGlyph.ACTIVE.value} "
-            f"[bold]{sensor}[/bold]([dim]{short}[/dim])"
-            f"{risk_repr} {summary}"
-            f"{target_repr}"
-        )
+            tail += f" [{tone}]{sep} {_escape(_humanise(state.risk_tier.lower()))}[/{tone}]"
+        if state.target_files:
+            primary = _short_path(state.target_files[0], max(20, line_chars() // 2))
+            tail += f" [dim]{_escape(primary)}[/dim]"
+        self._safe_print(self._lead(OpStatusGlyph.ACTIVE, state, tail=tail))
+        self._narrate_intent(state)
 
     def _handle_heartbeat(
         self, op_id: str, payload: Dict[str, Any],
@@ -420,13 +533,17 @@ class ClaudeStyleTransport:
         about tool activity and not about phase ticks. A plain phase tick
         keeps its old behaviour and its old gate.
 
-        Only the COMPLETION renders. The start event drives a spinner in
-        SerpentFlow; a line stream has no spinner, and printing both would
-        show every tool twice.
+        Only the COMPLETION renders as a tool block. The start event drives
+        a spinner in SerpentFlow; a line stream has no spinner, and printing
+        both would show every tool twice. But the start event is ALSO where
+        the model's one-sentence WHY (``preamble``) travels — the narration
+        the operator asked for — so the start narrates and the completion
+        draws.
         """
         tool_name = str(payload.get("tool_name", "") or "").strip()
         if tool_name:
             if payload.get("tool_starting"):
+                self._narrate_preamble(op_id, tool_name, payload)
                 return
             self._render_tool_call(op_id, tool_name, payload)
             return
@@ -483,23 +600,20 @@ class ClaudeStyleTransport:
                 if line:
                     self._safe_print(f"  {line}")
             return
-        # No `rich` import here — an authority invariant of this module,
-        # AST-pinned. Escaping every "[" is a strict superset of what
-        # rich.markup.escape neutralises, so model-controlled text can
-        # never open a tag.
-        def _escape(s: str) -> str:
-            return str(s).replace("[", "\\[")
-
         tone = _SEM["death"] if status not in ("success", "ok") else _SEM["dim"]
-        head = f"  [{_SEM['dim']}]⏺[/] [bold]{_escape(tool_name)}[/bold]"
+        head = (
+            f"  [{_SEM['dim']}]{_theme.mark('action')}[/] "
+            f"[bold]{_escape(tool_name)}[/bold]"
+        )
         if args:
-            head += f"([dim]{_escape(args[:60])}[/dim])"
+            head += f"([dim]{_escape(_clip_words(args, line_chars()))}[/dim])"
         if status not in ("success", "ok"):
             head += f" [{tone}]{_escape(status)}[/]"
         self._safe_print(head)
         if result:
             self._safe_print(
-                f"    [{_SEM['dim']}]⎿[/]  [dim]{_escape(result[:120])}[/dim]"
+                f"    [{_SEM['dim']}]{_theme.mark('detail')}[/]  "
+                f"[dim]{_escape(_clip_words(result, line_chars() * 2))}[/dim]"
             )
 
     def _handle_decision(
@@ -513,74 +627,75 @@ class ClaudeStyleTransport:
             # orphan reconciliation. Suppress.
             return
         elapsed = _format_elapsed(state.started_monotonic)
+        sep = _theme.mark("dot")
+        code = _humanise(payload.get("reason_code", ""))
+        # The model's own words about the outcome (a no-op's reason, a
+        # gate's explanation) ride `reason`; the code is the label.
+        words = str(payload.get("reason", "") or "")
+        path_budget = max(20, line_chars() // 2)
 
         if outcome in ("completed", "applied", "auto_approved"):
             files = payload.get("files_changed") or payload.get(
                 "affected_files",
             ) or []
-            files_repr = ""
+            tail = f" [dim]{sep} {elapsed}"
             if files:
-                first = str(files[0])
-                if len(first) > 40:
-                    parts = first.split("/")
-                    first = ".../" + "/".join(parts[-2:])
-                files_repr = f" [dim]{first}[/dim]"
+                tail += f" {sep} {_escape(_short_path(files[0], path_budget))}"
                 if len(files) > 1:
-                    files_repr += f" [dim]+{len(files) - 1}[/dim]"
-            self._safe_print(
-                f"[{_SEM['success']}]{OpStatusGlyph.DONE.value}[/] "
-                f"[bold]{state.sensor}[/bold]([dim]{state.short_id}[/dim])"
-                f" done [dim]({elapsed})[/dim]{files_repr}"
-            )
+                    tail += f" +{len(files) - 1}"
+            tail += "[/dim]"
+            self._safe_print(self._lead(OpStatusGlyph.DONE, state, tail=tail))
+            self._print_detail(words)
             self._done_count += 1
             self._feed_composer()
             return
 
         if outcome in ("failed", "postmortem"):
-            reason = str(payload.get("reason_code", "") or "")[:60]
-            self._safe_print(
-                f"[{_SEM['death']}]{OpStatusGlyph.FAILED.value}[/] "
-                f"[bold]{state.sensor}[/bold]([dim]{state.short_id}[/dim])"
-                f" shed: [{_SEM['death']}]{reason}[/] [dim]({elapsed})[/dim]"
-            )
+            tail = ""
+            if code:
+                tail += f" [{_SEM['death']}]{sep} shed: {_escape(code)}[/]"
+            tail += f" [dim]{sep} {elapsed}[/dim]"
+            self._safe_print(self._lead(OpStatusGlyph.FAILED, state, tail=tail))
+            self._print_detail(words)
             self._failed_count += 1
             self._feed_composer()
             return
 
         if outcome == "noop":
-            reason = str(payload.get("reason_code", "") or "")[:50]
-            reason_repr = f" [dim]{reason}[/dim]" if reason else ""
-            self._safe_print(
-                f"[dim]{OpStatusGlyph.NOOP.value}[/dim] "
-                f"[bold]{state.sensor}[/bold]([dim]{state.short_id}[/dim])"
-                f" no-op{reason_repr} [dim]({elapsed})[/dim]"
-            )
+            tail = f" [dim]{sep} no change {sep} {elapsed}[/dim]"
+            self._safe_print(self._lead(OpStatusGlyph.NOOP, state, tail=tail))
+            # Prefer the model's sentence; a bare "noop" code says nothing
+            # the lead line did not.
+            self._print_detail(words or (code if code != "noop" else ""))
+            return
+
+        if outcome == "cancelled":
+            tail = f" [dim]{sep} cancelled"
+            if code:
+                tail += f" {sep} {_escape(code)}"
+            tail += f" {sep} {elapsed}[/dim]"
+            self._safe_print(self._lead(OpStatusGlyph.CANCELLED, state, tail=tail))
+            self._print_detail(words)
             return
 
         if outcome == "notify_apply":
             files = payload.get("target_files", []) or []
-            files_repr = ""
+            tail = f" [{_SEM['heal']}]{sep} auto-applying[/]"
             if files:
-                first = str(files[0])[:40]
-                files_repr = f" [{_SEM['heal']}]{first}[/]"
+                tail += f" [{_SEM['heal']}]{_escape(_short_path(files[0], path_budget))}[/]"
                 if len(files) > 1:
-                    files_repr += f" [dim]+{len(files) - 1}[/dim]"
-            self._safe_print(
-                f"[{_SEM['heal']}]{OpStatusGlyph.RUNNING.value}[/] "
-                f"[bold]{state.sensor}[/bold]([dim]{state.short_id}[/dim])"
-                f" [{_SEM['heal']}]NOTIFY[/] auto-applying"
-                f"{files_repr} [dim]({elapsed})[/dim]"
-            )
+                    tail += f" [dim]+{len(files) - 1}[/dim]"
+            tail += f" [dim]{sep} {elapsed}[/dim]"
+            self._safe_print(self._lead(OpStatusGlyph.RUNNING, state, tail=tail))
             return
 
         if outcome == "escalated":
-            reason = str(payload.get("reason_code", "") or "")[:50]
-            self._safe_print(
-                f"[{_SEM['heal']}]{OpStatusGlyph.RUNNING.value}[/] "
-                f"[bold]{state.sensor}[/bold]([dim]{state.short_id}[/dim])"
-                f" [{_SEM['heal']}]escalated[/] [dim]{reason}"
-                f" ({elapsed})[/dim]"
-            )
+            tail = f" [{_SEM['heal']}]{sep} held for review[/]"
+            if code:
+                tail += f" [dim]{sep} {_escape(code)}[/dim]"
+            tail += f" [dim]{sep} {elapsed}[/dim]"
+            self._safe_print(self._lead(OpStatusGlyph.RUNNING, state, tail=tail))
+            self._print_detail(words)
             return
 
         # Unknown outcome — record state cleared but emit nothing
@@ -598,14 +713,20 @@ class ClaudeStyleTransport:
             _format_elapsed(state.started_monotonic)
             if state else "?"
         )
-        sensor = state.sensor if state else "Operation"
-        short = state.short_id if state else _short_id(op_id)
-        reason = str(payload.get("root_cause", "unknown") or "unknown")[:60]
-        self._safe_print(
-            f"[{_SEM['death']}]{OpStatusGlyph.FAILED.value}[/] "
-            f"[bold]{sensor}[/bold]([dim]{short}[/dim])"
-            f" postmortem: [{_SEM['death']}]{reason}[/] [dim]({elapsed})[/dim]"
+        if state is None:
+            state = _OpState(
+                op_id=op_id, short_id=_short_id(op_id),
+                sensor="Operation", summary="",
+            )
+        sep = _theme.mark("dot")
+        reason = _clip_words(
+            payload.get("root_cause", "unknown") or "unknown", line_chars(),
         )
+        tail = (
+            f" [{_SEM['death']}]{sep} postmortem: {_escape(reason)}[/]"
+            f" [dim]{sep} {elapsed}[/dim]"
+        )
+        self._safe_print(self._lead(OpStatusGlyph.FAILED, state, tail=tail))
 
     # -- helpers -----------------------------------------------------
 
@@ -634,12 +755,165 @@ class ClaudeStyleTransport:
         return "Operation"
 
     def _summarize(self, payload: Dict[str, Any]) -> str:
-        """One-line summary of the op's goal. Truncated to 70 chars
-        for terminal width hygiene."""
-        goal = str(payload.get("goal", "") or "").strip()
-        if len(goal) > 70:
-            goal = goal[:67] + "..."
-        return goal
+        """One line of the op's goal, cut at a word to the line budget."""
+        return _clip_words(payload.get("goal", ""), line_chars())
+
+    # -- the line shape --------------------------------------------------
+
+    def _lead(self, glyph: OpStatusGlyph, state: _OpState, *, tail: str = "") -> str:
+        """``<glyph> <Sensor> · <summary><tail>`` — every op line, one shape.
+        No id: the sensor and the summary are what the operator recognises
+        an op by, and a six-character hash they cannot ``/expand`` is noise."""
+        sep = _theme.mark("dot")
+        head = f"[{_SEM[glyph.role]}]{glyph.glyph}[/] [bold]{_escape(state.sensor)}[/bold]"
+        if state.summary:
+            head += f" {sep} {_escape(state.summary)}"
+        return head + tail
+
+    def _print_detail(self, text: object) -> None:
+        """The model's own words beneath an outcome line: wrapped to the
+        line budget, bounded in height, and marked as a continuation."""
+        prose = " ".join(str(text or "").split())
+        if not prose:
+            return
+        width = max(16, line_chars() - 4)
+        lines = textwrap.wrap(prose, width=width)
+        cap = detail_lines()
+        if len(lines) > cap:
+            lines = lines[:cap]
+            lines[-1] = lines[-1].rstrip(" ,;:.") + _theme.mark("ellipsis")
+        glyph = _theme.mark("detail")
+        pad = " " * len(glyph)
+        for i, line in enumerate(lines):
+            lead = glyph if i == 0 else pad
+            self._safe_print(
+                f"    [{_SEM['dim']} italic]{lead} {_escape(line)}[/{_SEM['dim']} italic]"
+            )
+
+    # -- narration ---------------------------------------------------------
+
+    def _narrate_intent(self, state: _OpState) -> None:
+        """Ask the model, off the render path, WHY this op — the 💭 line.
+        The same producer SerpentFlow calls from ``op_started``; the frame
+        it records comes back through the channel's commit signal and is
+        rendered by :meth:`_on_narrative_commit`. Never awaited here: a
+        transport that awaits a model stalls every other line behind it."""
+        try:
+            from backend.core.ouroboros.governance.intent_prompter import (
+                IntentRequest,
+                is_master_flag_enabled,
+                request_intent_and_emit,
+            )
+            if not is_master_flag_enabled():
+                return
+            loop = asyncio.get_running_loop()
+        except Exception:  # noqa: BLE001 — no voice is not a broken render
+            return
+        req = IntentRequest(
+            op_id=state.op_id,
+            goal=state.goal or state.summary,
+            risk_tier=state.risk_tier,
+            target_files=tuple(state.target_files[:5]),
+        )
+        try:
+            task = loop.create_task(
+                request_intent_and_emit(req, phase="OP_STARTED"),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[claude_style_transport] intent task refused",
+                         exc_info=True)
+            return
+        self._narration_tasks.add(task)
+        task.add_done_callback(self._narration_tasks.discard)
+
+    def _narrate_preamble(
+        self, op_id: str, tool_name: str, payload: Dict[str, Any],
+    ) -> None:
+        """One 🗣 line per (op, round) saying WHY the tool runs — the model's
+        own preamble when it wrote one, the deterministic template when it
+        did not (declared synthetic so the reader can tell). Recorded on the
+        NarrativeChannel like every other frame; rendering is the commit
+        listener's, so the line is subject to the operator's ``/narrate``
+        density and reaches every cockpit through the one seam."""
+        try:
+            round_index = int(payload.get("round_index", 0) or 0)
+        except (TypeError, ValueError):
+            round_index = 0
+        key = (op_id, round_index)
+        if key in self._preamble_keys:
+            return
+        preamble = str(payload.get("preamble", "") or "").strip()
+        provider = "model"
+        if not preamble:
+            try:
+                from backend.core.ouroboros.ui.narrative_density import audible
+                if not audible("narrative.tool_preamble"):
+                    return
+                from backend.core.ouroboros.governance.tool_preamble_synthesizer import (  # noqa: E501
+                    synthesize_preamble,
+                )
+                preamble = synthesize_preamble(
+                    tool_name, payload.get("tool_args_summary", ""),
+                    existing_preamble="", fallback_only=True,
+                )
+                provider = "synthetic"
+            except Exception:  # noqa: BLE001
+                return
+        if not preamble:
+            return
+        self._preamble_keys[key] = None
+        while len(self._preamble_keys) > _PREAMBLE_MEMORY:
+            self._preamble_keys.popitem(last=False)
+        try:
+            from backend.core.ouroboros.battle_test.narrative_channel import (
+                NarrativeKind,
+                get_default_channel,
+            )
+            get_default_channel().emit_complete(
+                op_id=op_id, phase=f"generate:{round_index}",
+                kind=NarrativeKind.TOOL_PREAMBLE, prose=preamble,
+                provider=provider,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[claude_style_transport] preamble emit failed",
+                         exc_info=True)
+
+    def _subscribe_narrative(self) -> None:
+        """Hear every frame that commits to the NarrativeChannel — intent,
+        preamble, plan prose, repair prose, postmortem, dream — and render
+        it. One subscription is what made the default surface silent: the
+        producers wrote frames nobody on this transport was listening for."""
+        try:
+            from backend.core.ouroboros.battle_test.narrative_channel import (
+                get_default_channel,
+            )
+            get_default_channel().add_commit_listener(self._on_narrative_commit)
+        except Exception:  # noqa: BLE001
+            logger.debug("[claude_style_transport] narrative subscribe failed",
+                         exc_info=True)
+
+    def _on_narrative_commit(self, frame: Any) -> None:
+        """Render one committed frame through the shared renderer (density
+        gate, provenance footing, glyph and tint all live there) into this
+        transport's one seam. NEVER raises into the channel."""
+        try:
+            from backend.core.ouroboros.battle_test.narrative_renderer import (
+                render_to_printer,
+            )
+            render_to_printer(
+                frame, self._print_narrative,
+                op_active=False, max_chars_per_line=line_chars(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[claude_style_transport] narrative render failed",
+                         exc_info=True)
+
+    def _print_narrative(self, markup: str, **_kw: Any) -> None:
+        """The renderer's print sink: one wire frame per line, so a wrapped
+        paragraph lands on the cockpit canvas row by row."""
+        for line in str(markup).split("\n"):
+            if line.strip():
+                self._safe_print(line)
 
     def _safe_print(self, text: str) -> None:
         """Console.print with defensive try/except. Falls back to
@@ -707,8 +981,21 @@ class ClaudeStyleTransport:
         return
 
     def shutdown(self) -> None:
-        """RenderBackend Protocol — no-op for this transport."""
-        return
+        """RenderBackend Protocol — release the narrative subscription and
+        let in-flight narration go. A transport that outlives its console
+        must not keep rendering into it."""
+        try:
+            from backend.core.ouroboros.battle_test.narrative_channel import (
+                get_default_channel,
+            )
+            get_default_channel().remove_commit_listener(self._on_narrative_commit)
+        except Exception:  # noqa: BLE001
+            pass
+        for task in tuple(self._narration_tasks):
+            try:
+                task.cancel()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _handle_file_ref(self, event: Any) -> None:
         """FILE_REF → render as Claude-style Update(<path>) block.
@@ -836,6 +1123,40 @@ def register_flags(registry: Any) -> int:
             ),
             example="false",
             since="v1.0",
+        ),
+        FlagSpec(
+            name=_FLAG_LINE_CHARS,
+            type=FlagType.INT,
+            default=_DEFAULT_LINE_CHARS,
+            description=(
+                "Characters of goal summary on a Claude-style op line, and "
+                "the wrap width of the organism's narration beneath it. "
+                "Summaries are cut at a word boundary with an ellipsis."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "claude_style_transport.py"
+            ),
+            example=str(_DEFAULT_LINE_CHARS),
+            since="v1.1",
+        ),
+        FlagSpec(
+            name=_FLAG_DETAIL_LINES,
+            type=FlagType.INT,
+            default=_DEFAULT_DETAIL_LINES,
+            description=(
+                "Lines of the model's own reason shown beneath an outcome "
+                "line (a no-op's explanation, a gate's) before the rest is "
+                "elided."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "claude_style_transport.py"
+            ),
+            example=str(_DEFAULT_DETAIL_LINES),
+            since="v1.1",
         ),
     ]
     registry.bulk_register(specs, override=True)

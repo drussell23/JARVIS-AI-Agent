@@ -15368,6 +15368,8 @@ class GovernedOrchestrator:
                     # future duplicate if the OP_COMPLETED path is
                     # wired up later. NEVER raises into _record_ledger.
                     _slice12q_record_terminal(ctx, state, data)
+                    # ── Terminal voice — the outcome reaches the transport ──
+                    await self._emit_terminal_decision(ctx, state, data)
                     # ── Slice 12AA — Per-op reservation release ──
                     # Free the foreground op's reserved session
                     # runway so subsequent ops can use it. Lazy-
@@ -15393,6 +15395,77 @@ class GovernedOrchestrator:
                     entry.op_id, entry.state.value,
                     exc_info=True,
                 )
+
+    async def _emit_terminal_decision(
+        self,
+        ctx: OperationContext,
+        state: OperationState,
+        data: Dict[str, Any],
+    ) -> None:
+        """Speak the op's terminal outcome on the comm wire.
+
+        ``ChangeEngine`` emits a DECISION for the one outcome it owns — a
+        real apply. Every other way an op ends (the model declining because
+        the change is already present, a generation failure, a rollback, a
+        gate holding it for a human) reached the ledger and the SSE broker
+        and never the transport, so the transcript showed an op begin and
+        never end: measured 2026-09-06, 116 ``2b.1-noop`` refusals and not
+        one closing line. This is the ONE terminal chokepoint, so it is
+        where the remaining outcomes are spoken — reading the signals the
+        ledger already reads, adding no state. An apply with no terminal
+        reason is left to ChangeEngine (a second DECISION for the same op
+        would be dropped by the transport, but the wire should carry one).
+        Best-effort; NEVER raises into ``_record_ledger``.
+        """
+        try:
+            comm = getattr(self._stack, "comm", None)
+            if comm is None:
+                return
+            state_value = str(getattr(state, "value", state) or "").lower()
+            reason_code = str(
+                getattr(ctx, "terminal_reason_code", "")
+                or (isinstance(data, dict)
+                    and (data.get("reason") or data.get("error")))
+                or ""
+            )
+            generation = getattr(ctx, "generation", None)
+            words = ""
+            if state_value == "applied":
+                if not reason_code:
+                    return
+                is_noop = bool(getattr(generation, "is_noop", False))
+                normalised = reason_code.replace("_", "").lower()
+                outcome = (
+                    "noop" if is_noop or normalised.startswith("noop")
+                    or "noop" in normalised else "completed"
+                )
+                words = str(getattr(generation, "noop_reason", "") or "")
+            elif state_value == "failed":
+                outcome = "failed"
+            elif state_value == "rolled_back":
+                outcome = "failed"
+                reason_code = reason_code or "rolled_back"
+            elif state_value == "blocked":
+                outcome = "escalated"
+            else:
+                return
+            if not words and isinstance(data, dict):
+                words = str(data.get("detail") or "")
+            await comm.emit_decision(
+                op_id=str(getattr(ctx, "op_id", "") or ""),
+                outcome=outcome,
+                reason_code=reason_code or state_value,
+                target_files=[
+                    str(p) for p in (getattr(ctx, "target_files", ()) or ())
+                ],
+                reason=words,
+                terminal_state=state_value,
+            )
+        except Exception:  # noqa: BLE001 — the voice never touches the FSM
+            logger.debug(
+                "[Orchestrator] terminal DECISION emit failed (swallowed): "
+                "op_id=%s", getattr(ctx, "op_id", "?"), exc_info=True,
+            )
 
 
 # Alias so tests can import `Orchestrator` as well as `GovernedOrchestrator`

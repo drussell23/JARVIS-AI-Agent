@@ -2,6 +2,7 @@
 import sys
 
 import backend.core.ouroboros.battle_test.presentation_restraint as PR
+from backend.core.ouroboros.ui import theme
 
 
 class _FakeStdout:
@@ -20,29 +21,43 @@ class _FakeStdout:
 
 
 # --------------------------------------------------------------------------- glyphs
+# The glyphs come from the ONE design-language table (`theme._GLYPHS`) and
+# degrade with it, for the terminal that will DISPLAY them — the theme asks
+# an attached cockpit before the local locale. The spinner is local and
+# still keys off stdout.
 def test_glyphs_utf8(monkeypatch):
-    monkeypatch.setattr(sys, "stdout", _FakeStdout("utf-8"))
+    monkeypatch.setattr(theme, "supports_unicode", lambda env=None: True)
     g = PR.glyphs()
     assert g["action"] == "⏺" and g["result"] == "⎿"
+    monkeypatch.setattr(sys, "stdout", _FakeStdout("utf-8"))
     assert PR.spinner_name() == "dots"
 
 
 def test_glyphs_ascii_fallback(monkeypatch):
-    monkeypatch.setattr(sys, "stdout", _FakeStdout("ascii"))
+    monkeypatch.setattr(theme, "supports_unicode", lambda env=None: False)
     g = PR.glyphs()
-    assert g["action"] == "*" and g["result"] == ">"
+    assert g["action"] == "*" and g["result"] == "-"   # the table's ASCII forms
+    monkeypatch.setattr(sys, "stdout", _FakeStdout("ascii"))
     assert PR.spinner_name() == "line"
 
 
-def test_glyphs_none_encoding_is_safe(monkeypatch):
+def test_glyphs_are_the_theme_marks(monkeypatch):
+    for want in (True, False):
+        monkeypatch.setattr(theme, "supports_unicode", lambda env=None, _w=want: _w)
+        assert PR.glyphs() == {
+            "action": theme.mark("action", unicode=want),
+            "result": theme.mark("detail", unicode=want),
+        }
+
+
+def test_spinner_none_encoding_is_safe(monkeypatch):
     monkeypatch.setattr(sys, "stdout", _FakeStdout(None))   # encoding can be None
-    assert PR.glyphs()["action"] == "*"          # degrades, never raises
     assert PR.spinner_name() == "line"
 
 
-def test_glyphs_missing_stdout_is_safe(monkeypatch):
+def test_spinner_missing_stdout_is_safe(monkeypatch):
     monkeypatch.setattr(sys, "stdout", object())  # no .encoding attr at all
-    assert PR.glyphs()["action"] == "*"          # fail-safe to ASCII
+    assert PR.spinner_name() == "line"            # fail-safe to ASCII
 
 
 # --------------------------------------------------------------------------- print_fit

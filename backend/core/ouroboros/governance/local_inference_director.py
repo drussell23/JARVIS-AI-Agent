@@ -555,6 +555,38 @@ def _apply_response_format(body: "Dict[str, Any]", cfg: "LocalConfig") -> str:
         return "none"
 
 
+#: "Use the ladder" -- the per-call default for ``response_format``. A
+#: SENTINEL rather than ``None`` because ``None`` has to mean something
+#: too: *no constraint at all*, which is what a prose completion (a gate's
+#: one-sentence intent, a narrated reason) needs. Until this existed every
+#: completion through this client was forced into the CANDIDATE grammar,
+#: so a prose caller got a JSON object back -- the ladder was a property of
+#: the client when it is a property of the CALL.
+RESPONSE_FORMAT_LADDER: Any = object()
+
+
+def _apply_explicit_response_format(body: "Dict[str, Any]", cfg: "LocalConfig",
+                                    fmt: "Dict[str, Any]") -> str:
+    """Attach a caller-supplied OpenAI-shaped ``response_format``, spelled
+    for the transport in use. ``{"type": "json_object"}`` is the only shape
+    a gate asks for today; a ``json_schema`` shape carries its schema
+    through. Returns the mode applied, for telemetry. NEVER raises."""
+    try:
+        kind = str(fmt.get("type", "") or "") if isinstance(fmt, dict) else ""
+        if not kind:
+            return "none"
+        if is_native_transport(cfg):
+            schema = None
+            if kind == "json_schema":
+                schema = (fmt.get("json_schema") or {}).get("schema")
+            body["format"] = schema or "json"
+        else:
+            body["response_format"] = dict(fmt)
+        return kind
+    except Exception:  # noqa: BLE001
+        return "none"
+
+
 #: (base_url, model) pairs that have REJECTED a ``reasoning_effort`` field.
 #: Kept separate from ``_SCHEMA_UNSUPPORTED`` deliberately: attributing a
 #: reasoning_effort rejection to the schema would permanently disable
@@ -1630,7 +1662,8 @@ class LocalPrimeClient:
                        max_tokens: "Optional[int]" = None,
                        stream: "Optional[bool]" = None,
                        prefill: str = "",
-                       sampling: "Optional[Any]" = None) -> LocalCompletion:
+                       sampling: "Optional[Any]" = None,
+                       response_format: Any = RESPONSE_FORMAT_LADDER) -> LocalCompletion:
         sess = await self._ensure_session()
         url = chat_endpoint(self._cfg)
         # Dynamic Cognitive Compression + num_ctx injection (Context-Hardware
@@ -1703,7 +1736,13 @@ class LocalPrimeClient:
         # Advertised as opt-out (default ON) but harmless where unsupported: an
         # engine that does not know the field ignores it, which is exactly the
         # pre-existing behaviour.
-        _apply_response_format(body, self._cfg)
+        # The constraint is the CALL's, not the client's: the ladder for a
+        # candidate generation (the default -- byte-identical), an explicit
+        # shape when the caller has one, nothing at all for prose.
+        if response_format is RESPONSE_FORMAT_LADDER:
+            _apply_response_format(body, self._cfg)
+        elif response_format:
+            _apply_explicit_response_format(body, self._cfg, response_format)
         # Thinking budget. Same seam, same discipline: declared here once so
         # the streaming and non-streaming paths cannot disagree, and dropped
         # by observation if the engine refuses the field.
@@ -2061,7 +2100,8 @@ class LocalPrimeClient:
     async def complete_guarded(self, *, system: str, user: str, prompt_tokens: int,
                                temperature: float = 0.2,
                                max_tokens: "Optional[int]" = None,
-                               sampling: "Optional[Any]" = None) -> LocalCompletion:
+                               sampling: "Optional[Any]" = None,
+                               response_format: Any = RESPONSE_FORMAT_LADDER) -> LocalCompletion:
         # HEAVY (num_ctx) STREAMING path: deprecate the total-duration timeout. The
         # Inter-Token Watchdog inside _complete_streaming is the sole guard -- a
         # model that keeps emitting tokens runs indefinitely; only a STALL trips it.
@@ -2075,7 +2115,7 @@ class LocalPrimeClient:
             return await self.complete(
                 system=system, user=user, prompt_tokens=prompt_tokens,
                 temperature=temperature, max_tokens=max_tokens, stream=True,
-                sampling=sampling,
+                sampling=sampling, response_format=response_format,
             )
 
         # SURVIVAL / non-streaming path: legacy total-duration adaptive timeout.
@@ -2092,7 +2132,7 @@ class LocalPrimeClient:
             return await asyncio.wait_for(
                 self.complete(system=system, user=user, prompt_tokens=prompt_tokens,
                               temperature=temperature, max_tokens=max_tokens,
-                              sampling=sampling),
+                              sampling=sampling, response_format=response_format),
                 timeout=timeout_ms / 1000.0,
             )
         except asyncio.TimeoutError as e:
@@ -2106,7 +2146,9 @@ class LocalPrimeClient:
                        context: "Optional[Any]" = None, max_tokens: int = 4096,
                        temperature: float = 0.7, model_name: "Optional[str]" = None,
                        task_profile: "Optional[Any]" = None,
-                       sampling: "Optional[Any]" = None, **kwargs: Any) -> Any:
+                       sampling: "Optional[Any]" = None,
+                       response_format: Any = RESPONSE_FORMAT_LADDER,
+                       **kwargs: Any) -> Any:
         """Drop-in PrimeClient.generate adapter -> PrimeResponse (source=local_prime).
 
         context/task_profile are accepted for interface parity; the 3B path relies
@@ -2129,7 +2171,7 @@ class LocalPrimeClient:
         lc = await self.complete_guarded(
             system=sys_txt, user=prompt, prompt_tokens=est_tokens,
             temperature=temperature, max_tokens=max_tokens,
-            sampling=sampling,
+            sampling=sampling, response_format=response_format,
         )
         return PrimeResponse(
             content=lc.text,

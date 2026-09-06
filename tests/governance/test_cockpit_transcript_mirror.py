@@ -150,14 +150,18 @@ def test_a_completed_tool_call_renders_regardless_of_heartbeat_chatter(
     assert "backend/x.py" in blob, "with the tool's arguments"
 
 
-def test_the_start_event_is_silent_so_nothing_renders_twice(monkeypatch) -> None:
+def test_the_start_event_draws_no_block_so_nothing_renders_twice(monkeypatch) -> None:
+    """The start event NARRATES (the model's WHY rides it — see
+    test_transport_narration_and_design.py) but never draws the tool block;
+    that is the completion's, or every tool would show twice."""
+    from backend.core.ouroboros.ui import theme
     monkeypatch.setattr(cst, "show_heartbeats", lambda: False)
     console = _Console()
     t = cst.ClaudeStyleTransport(console=console)
     asyncio.run(_intent(t))
     console.prints.clear()
     asyncio.run(t.send(_tool_heartbeat(starting=True)))
-    assert console.prints == []
+    assert not any(theme.mark("action") in p for p in console.prints)
 
 
 def test_a_tool_call_from_an_op_whose_intent_was_missed_still_renders(

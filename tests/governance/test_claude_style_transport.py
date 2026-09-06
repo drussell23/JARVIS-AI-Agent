@@ -39,6 +39,7 @@ import pytest
 from backend.core.ouroboros.governance import (
     claude_style_transport as cst,
 )
+from backend.core.ouroboros.ui import theme
 
 
 # ---------------------------------------------------------------------------
@@ -51,9 +52,20 @@ def _isolate_flag_env(monkeypatch: pytest.MonkeyPatch):
     for name in (
         "JARVIS_RENDER_MODE",
         "JARVIS_CLAUDE_STYLE_SHOW_HEARTBEATS",
+        "JARVIS_CLAUDE_STYLE_LINE_CHARS",
+        "JARVIS_CLAUDE_STYLE_DETAIL_LINES",
     ):
         monkeypatch.delenv(name, raising=False)
+    # The transport now narrates: keep the model out of a unit test, and
+    # give every test its own NarrativeChannel so subscriptions never
+    # accumulate across transports. Narration itself is proven in
+    # test_transport_narration_and_design.py.
+    from backend.core.ouroboros.governance import intent_prompter as _ip
+    monkeypatch.setattr(_ip, "is_master_flag_enabled", lambda: False)
+    from backend.core.ouroboros.battle_test import narrative_channel as _nc
+    _nc.reset_default_channel_for_tests()
     yield
+    _nc.reset_default_channel_for_tests()
 
 
 @pytest.fixture
@@ -99,9 +111,17 @@ class TestOpStatusGlyphClosedTaxonomy:
         }
 
     def test_glyph_values_distinct(self):
-        # Every bullet must be unique to be visually distinguishable
+        # Six distinct STATUSES. Two may share a MARK — outcomes are told
+        # apart by colour and copy (OV_DESIGN_LANGUAGE §3.4), never by a
+        # glyph outside the six-glyph ration.
         values = [m.value for m in cst.OpStatusGlyph]
         assert len(set(values)) == len(values)
+
+    def test_every_mark_is_in_the_design_ration(self):
+        for m in cst.OpStatusGlyph:
+            assert theme.mark(m.mark, unicode=True), m
+            assert theme.mark(m.mark, unicode=False), m
+            assert m.role in cst._SEM, m
 
 
 # ---------------------------------------------------------------------------
@@ -152,12 +172,12 @@ class TestIntentRendering:
         }))
         assert len(console.prints) == 1
         line = console.prints[0]
-        assert "·" in line
+        assert theme.mark("action") in line          # an actor does something
         assert "TestFailure" in line
-        assert "op7c17" in line  # short_id
+        assert "op7c17" not in line  # a hash the operator cannot /expand is noise
         assert "Wave 3 graduation" in line
 
-    async def test_risk_tier_renders_in_brackets(self, fresh_registry):
+    async def test_risk_tier_renders_as_words(self, fresh_registry):
         console = _RecordingConsole()
         t = cst.ClaudeStyleTransport(console=console)
         await t.send(_msg("INTENT", "op-1", {
@@ -165,7 +185,8 @@ class TestIntentRendering:
             "outcome_source": "TestFailure",
             "risk_tier": "APPROVAL_REQUIRED",
         }))
-        assert "APPROVAL_REQUIRED" in console.prints[0]
+        assert "approval required" in console.prints[0]   # never a raw enum
+        assert "APPROVAL_REQUIRED" not in console.prints[0]
 
     async def test_safe_auto_risk_not_shown(self, fresh_registry):
         console = _RecordingConsole()
@@ -187,8 +208,9 @@ class TestIntentRendering:
             "outcome_source": "Operation",
             "target_files": [long_path],
         }))
-        # Path truncated to .../parent/file.py form
-        assert "..." in console.prints[0]
+        # Path shortened to …/parent/file.py with the theme's ellipsis
+        assert theme.mark("ellipsis") in console.prints[0]
+        assert "file.py" in console.prints[0]
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +235,9 @@ class TestDecisionOutcomes:
             "files_changed": ["x.py"],
         }))
         line = console.prints[0]
-        assert cst.OpStatusGlyph.DONE.value in line
+        assert cst.OpStatusGlyph.DONE.glyph in line
         assert "TestFailure" in line
-        assert "done" in line
+        assert "x.py" in line
 
     async def test_failed_renders_shed_line(self, fresh_registry):
         console = _RecordingConsole()
@@ -227,9 +249,9 @@ class TestDecisionOutcomes:
             "reason_code": "background_dw_blocked",
         }))
         line = console.prints[0]
-        assert cst.OpStatusGlyph.FAILED.value in line
+        assert cst.OpStatusGlyph.FAILED.glyph in line
         assert "shed" in line
-        assert "background_dw_blocked" in line
+        assert "background dw blocked" in line      # the code, as words
 
     async def test_noop_renders_skip_line(self, fresh_registry):
         console = _RecordingConsole()
@@ -241,8 +263,8 @@ class TestDecisionOutcomes:
             "reason_code": "duplicate_signal",
         }))
         line = console.prints[0]
-        assert cst.OpStatusGlyph.NOOP.value in line
-        assert "no-op" in line
+        assert cst.OpStatusGlyph.NOOP.glyph in line
+        assert "no change" in line
 
     async def test_notify_apply_renders_yellow_line(self, fresh_registry):
         console = _RecordingConsole()
@@ -254,8 +276,9 @@ class TestDecisionOutcomes:
             "target_files": ["x.py"],
         }))
         line = console.prints[0]
-        assert "NOTIFY" in line
         assert "auto-applying" in line
+        assert "x.py" in line
+        assert cst._SEM["heal"] in line              # the tier is a colour, not a word
 
     async def test_escalated_renders_yellow_line(self, fresh_registry):
         console = _RecordingConsole()
@@ -267,7 +290,8 @@ class TestDecisionOutcomes:
             "reason_code": "iron_gate_block",
         }))
         line = console.prints[0]
-        assert "escalated" in line
+        assert "held for review" in line
+        assert "iron gate block" in line
 
     async def test_decision_without_intent_silently_dropped(
         self, fresh_registry,
@@ -308,7 +332,7 @@ class TestPostmortem:
             "root_cause": "VERIFY phase exhausted retries",
         }))
         line = console.prints[0]
-        assert cst.OpStatusGlyph.FAILED.value in line
+        assert cst.OpStatusGlyph.FAILED.glyph in line
         assert "postmortem" in line
         assert "VERIFY" in line
 

@@ -952,11 +952,16 @@ def _tool_chrome_line(
     says what it is busy with.
     """
     try:
+        from backend.core.ouroboros.ui import theme as _ov_theme
+        act = _ov_theme.mark("action")
+    except Exception:  # noqa: BLE001 — the theme never raises; belt and braces
+        act = "*"
+    try:
         verb = derive_verb(tool_name, mcp_servers)
         arg = _clip_arg(args_summary)
-        return f"⏺ {verb}({arg})" if arg else f"⏺ {verb}"
+        return f"{act} {verb}({arg})" if arg else f"{act} {verb}"
     except Exception:  # noqa: BLE001 — chrome must never break a tool round
-        return f"⏺ {tool_name or 'Tool'}"
+        return f"{act} {tool_name or 'Tool'}"
 
 
 class SerpentFlow:

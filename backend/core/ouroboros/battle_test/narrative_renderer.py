@@ -334,6 +334,28 @@ def render_to_console(
 
     NEVER raises.
     """
+    print_fn = getattr(console, "print", None)
+    if not callable(print_fn):
+        return False
+    return render_to_printer(
+        frame, print_fn,
+        op_active=op_active, max_chars_per_line=max_chars_per_line,
+    )
+
+
+def render_to_printer(
+    frame: NarrativeFrame,
+    print_fn: object,
+    *,
+    op_active: bool = True,
+    max_chars_per_line: int = 0,
+) -> bool:
+    """The surfacing seam behind :func:`render_to_console`, for a surface
+    whose sink is not a console -- a transport that mirrors every line to
+    attached cockpits through one ``_safe_print``. Same density gate, same
+    provenance footing, same composition; only the sink differs, so the
+    organism's voice reads identically on every surface. NEVER raises.
+    """
     # The SURFACING seam for the model's voice, and therefore where the
     # operator's `/narrate` density applies. Deliberately not `start_frame`:
     # the channel is a ring the operator can page back through with `n-N`,
@@ -356,7 +378,6 @@ def render_to_console(
     )
     if not rendered.markup:
         return False
-    print_fn = getattr(console, "print", None)
     if not callable(print_fn):
         return False
     try:
@@ -374,7 +395,15 @@ def render_to_console(
             from backend.core.ouroboros.ui.provenance import (
                 Provenance, annotate, claiming,
             )
-            with claiming(Provenance.MODELED) as resolved:
+            # A frame whose PRODUCER declared it synthetic (a template the
+            # code filled in because the model supplied nothing) carries
+            # that footing in `provider`; the stricter claim wins.
+            _footing = (
+                Provenance.SYNTHETIC
+                if str(getattr(frame, "provider", "") or "").lower() == "synthetic"
+                else Provenance.MODELED
+            )
+            with claiming(_footing) as resolved:
                 markup = annotate(markup, resolved)
         except Exception:  # noqa: BLE001 — an unmarked line beats no line
             markup = rendered.markup
@@ -395,4 +424,5 @@ __all__ = [
     "compose",
     "get_style",
     "render_to_console",
+    "render_to_printer",
 ]

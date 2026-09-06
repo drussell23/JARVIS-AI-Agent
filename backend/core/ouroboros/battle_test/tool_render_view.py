@@ -39,6 +39,7 @@ Authority boundary
 """
 from __future__ import annotations
 
+from backend.core.ouroboros.ui import theme as _theme
 import json
 import logging
 import os
@@ -636,13 +637,13 @@ def _compose_header(
             verb = rendered_header[:lparen]
             inner = rendered_header[lparen + 1 : rparen]
             return (
-                f"[{verb_color}]⏺ {verb}[/{verb_color}]"
+                f"[{verb_color}]{_theme.mark('action')} {verb}[/{verb_color}]"
                 f"([{arg_color}]{_escape(inner)}[/{arg_color}])"
                 f"{duration_part}{status_part}"
             )
         # Fall-through: emit as a plain neural-coloured header
         return (
-            f"[{verb_color}]⏺ {_escape(rendered_header)}[/{verb_color}]"
+            f"[{verb_color}]{_theme.mark('action')} {_escape(rendered_header)}[/{verb_color}]"
             f"{duration_part}{status_part}"
         )
 
@@ -663,7 +664,7 @@ def _compose_header(
     except Exception:  # noqa: BLE001
         verb = rendered_header
     return (
-        f"[{verb_color}]⏺ {_escape(verb)}[/{verb_color}]"
+        f"[{verb_color}]{_theme.mark('action')} {_escape(verb)}[/{verb_color}]"
         f"([{file_color}]{_escape(inner)}[/{file_color}])"
         f"{duration_part}{status_part}"
     )

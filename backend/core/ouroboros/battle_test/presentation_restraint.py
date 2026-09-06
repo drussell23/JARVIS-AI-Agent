@@ -1120,8 +1120,11 @@ def real_stdout_isatty() -> bool:
 # Encoding-aware glyph vocabulary (ASCII fallback for non-UTF-8 terminals)
 # ---------------------------------------------------------------------------
 
-_GLYPHS_UTF8 = {"action": "\u23fa", "result": "\u23bf"}
-_GLYPHS_ASCII = {"action": "*", "result": ">"}
+#: The two marks this module hands out, by their design-language names.
+#: The glyphs themselves live in ``theme._GLYPHS`` — ONE table, ONE
+#: degradation. This module used to keep a second copy, with a different
+#: ASCII form for the continuation mark, and a probe of its own.
+_GLYPH_MARKS = {"action": "action", "result": "detail"}
 
 
 def _stdout_supports_utf8() -> bool:
@@ -1134,8 +1137,11 @@ def _stdout_supports_utf8() -> bool:
 
 
 def glyphs() -> dict:
-    """Glyph vocabulary, degraded to ASCII on non-UTF-8 stdout."""
-    return dict(_GLYPHS_UTF8 if _stdout_supports_utf8() else _GLYPHS_ASCII)
+    """Glyph vocabulary from the design-language table, degraded for the
+    terminal that will DISPLAY it. The theme asks an attached cockpit
+    before the local locale; stdout's encoding is the wrong question for a
+    daemon rendering for a terminal it does not own."""
+    return {name: theme.mark(mark) for name, mark in _GLYPH_MARKS.items()}
 
 
 def borderless_enabled() -> bool:

@@ -808,8 +808,9 @@ def wire_render_conductor(
         return conductor  # still return; tests may use it directly
 
     logger.info(
-        "[render_backends] conductor wired with %d backend(s)",
+        "[render_backends] conductor wired with %d backend(s): %s",
         len(conductor.backends()),
+        ", ".join(getattr(b, "name", type(b).__name__) for b in conductor.backends()),
     )
     return conductor
 

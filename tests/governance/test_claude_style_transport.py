@@ -315,6 +315,68 @@ class TestDecisionOutcomes:
 
 
 # ---------------------------------------------------------------------------
+# §D2 — Authoritative elapsed (op lifetime), not the local observation clock
+# ---------------------------------------------------------------------------
+
+
+class TestElapsedResolution:
+    def test_format_duration_units(self):
+        assert cst._format_duration(5.0) == "5.0s"
+        assert cst._format_duration(134.0) == "2m 14s"
+        assert cst._format_duration(3725.0) == "1h 2m"
+        # Defensive: negatives clamp to 0, non-numeric degrades not raises.
+        assert cst._format_duration(-3.0) == "0.0s"
+        assert cst._format_duration(None) == "0.0s"
+        # Absurd values clamp to the 24h ceiling rather than overflow.
+        assert cst._format_duration(10 ** 12) == "24h 0m"
+
+    def test_resolve_elapsed_prefers_authoritative_duration(self):
+        # An op the cockpit met only at its terminal state has no local
+        # start (started_monotonic=0.0) -> the old path rendered 0.0s. The
+        # terminal DECISION's authoritative op lifetime must win.
+        t = cst.ClaudeStyleTransport(console=_RecordingConsole())
+        state = cst._OpState(
+            op_id="op-held", short_id="opheld",
+            sensor="Operation", summary="", started_monotonic=0.0,
+        )
+        assert t._resolve_elapsed(state, {"duration_s": 134.0}) == "2m 14s"
+
+    def test_resolve_elapsed_falls_back_to_local_when_absent(self):
+        # No duration on the wire (older emitter / non-orchestrator
+        # DECISION): fall back to the local clock, which is 0.0s for an
+        # unobserved op -- honest 'unknown', never a fabricated number.
+        t = cst.ClaudeStyleTransport(console=_RecordingConsole())
+        state = cst._OpState(
+            op_id="op-held", short_id="opheld",
+            sensor="Operation", summary="", started_monotonic=0.0,
+        )
+        assert t._resolve_elapsed(state, {}) == "0.0s"
+        # A malformed duration degrades to the fallback, never raises.
+        assert t._resolve_elapsed(state, {"duration_s": "nan-ish"}) == "0.0s"
+
+    @pytest.mark.asyncio
+    async def test_decision_duration_renders_over_local_clock(
+        self, fresh_registry,
+    ):
+        # Full path: an op announced via INTENT (local elapsed ~0.0s) whose
+        # terminal DECISION carries the authoritative lifetime renders that
+        # lifetime on both the outcome line and the recap beneath it.
+        console = _RecordingConsole()
+        t = cst.ClaudeStyleTransport(console=console)
+        await t.send(_msg("INTENT", "op-1", {
+            "goal": "test op", "outcome_source": "TestFailure",
+        }))
+        console.prints.clear()
+        await t.send(_msg("DECISION", "op-1", {
+            "outcome": "completed", "files_changed": ["x.py"],
+            "duration_s": 134.0,
+        }))
+        blob = "\n".join(console.prints)
+        assert "2m 14s" in blob
+        assert "0.0s" not in blob
+
+
+# ---------------------------------------------------------------------------
 # §E — POSTMORTEM
 # ---------------------------------------------------------------------------
 

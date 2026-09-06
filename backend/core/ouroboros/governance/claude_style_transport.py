@@ -330,17 +330,30 @@ def _short_id(op_id: str) -> str:
     return op_id[:6] or "......"
 
 
-def _format_elapsed(started_monotonic: float) -> str:
-    """Format an elapsed time relative to start_monotonic. Defensive
-    — clamps negative or absurdly large values to a 24h ceiling."""
-    if started_monotonic <= 0.0:
+def _format_duration(seconds: float) -> str:
+    """Render a duration in SECONDS as ``Xs`` / ``Xm Ys`` / ``Xh Ym``.
+    The single formatter for every elapsed value the transport prints;
+    clamps negative or absurd inputs to ``[0, 24h]`` so a bad clock can
+    never corrupt the line. NEVER raises."""
+    try:
+        elapsed = max(0.0, min(float(seconds or 0.0), 86400.0))
+    except (TypeError, ValueError):
         return "0.0s"
-    elapsed = max(0.0, min(time.monotonic() - started_monotonic, 86400.0))
     if elapsed < 60:
         return f"{elapsed:.1f}s"
     if elapsed < 3600:
         return f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
     return f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m"
+
+
+def _format_elapsed(started_monotonic: float) -> str:
+    """Elapsed since a monotonic start. ``<= 0`` means this cockpit never
+    observed the op's start (it was recovered at its terminal state, or the
+    client attached mid-flight); the caller supplies the authoritative
+    lifecycle duration instead of this local reading."""
+    if started_monotonic <= 0.0:
+        return "0.0s"
+    return _format_duration(time.monotonic() - started_monotonic)
 
 
 def _escape(s: object) -> str:
@@ -699,7 +712,7 @@ class ClaudeStyleTransport:
                 # Decision without prior INTENT and without a terminal
                 # stamp — boot-time orphan reconciliation. Suppress.
                 return
-        elapsed = _format_elapsed(state.started_monotonic)
+        elapsed = self._resolve_elapsed(state, payload)
         sep = _theme.mark("dot")
         code = _humanise(payload.get("reason_code", ""))
         # The model's own words about the outcome (a no-op's reason, a
@@ -788,7 +801,7 @@ class ClaudeStyleTransport:
         failed DECISION; some pipelines emit POSTMORTEM separately."""
         state = self._op_state.pop(op_id, None)
         elapsed = (
-            _format_elapsed(state.started_monotonic)
+            self._resolve_elapsed(state, payload)
             if state else "?"
         )
         if state is None:
@@ -875,6 +888,27 @@ class ClaudeStyleTransport:
         if state.summary:
             head += f" {sep} {_escape(state.summary)}"
         return head + tail
+
+    def _resolve_elapsed(self, state: "_OpState", payload: Dict[str, Any]) -> str:
+        """The op's elapsed for BOTH the outcome line and the recap.
+
+        Prefers the orchestrator's authoritative lifecycle duration -- the
+        op's ``created_at`` (stamped at CLASSIFY, carried immutably through
+        every advance) to its terminal seam, delivered on the terminal
+        DECISION as ``duration_s``. The transport's own ``started_monotonic``
+        clock only measures from when THIS cockpit client first observed the
+        op, so an op it meets only at its terminal state -- a gate held it
+        before it ever announced, or the client attached mid-flight -- has no
+        local start and would read ``0.0s``. Falls back to the local clock
+        when the wire carries no duration (an emitter that predates the
+        field, or a non-orchestrator DECISION). NEVER raises."""
+        try:
+            _auth = float(payload.get("duration_s", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            _auth = 0.0
+        if _auth > 0.0:
+            return _format_duration(_auth)
+        return _format_elapsed(getattr(state, "started_monotonic", 0.0))
 
     def _emit_recap(self, state: "_OpState", elapsed: str, payload: Dict[str, Any],
                     *, aborted: bool = False, failed: bool = False) -> None:

@@ -15465,6 +15465,25 @@ class GovernedOrchestrator:
                 _tokens = _rc_tokens(generation)
             except Exception:  # noqa: BLE001
                 pass
+            # Authoritative op duration for the recap + outcome line. The
+            # op's lifetime is created_at (stamped at CLASSIFY, carried
+            # immutably through every advance) -> now. The transport measures
+            # elapsed from when ITS cockpit client first observed the op, so
+            # an op it meets only at its terminal state (a gate held it with
+            # no INTENT, or a client attached mid-flight) reads 0.0s. Supplied
+            # here, the lifecycle duration lets the transport render the true
+            # time for every terminal op, not only the ones it watched from
+            # INTENT. Best-effort: a missing/naive stamp yields 0.0, which the
+            # transport reads as 'unknown' and falls back to its local clock.
+            _dur_s = 0.0
+            try:
+                _created = getattr(ctx, "created_at", None)
+                if _created is not None:
+                    from datetime import datetime as _dt
+                    _ref = _dt.now(getattr(_created, "tzinfo", None))
+                    _dur_s = max(0.0, (_ref - _created).total_seconds())
+            except Exception:  # noqa: BLE001
+                _dur_s = 0.0
             await comm.emit_decision(
                 op_id=str(getattr(ctx, "op_id", "") or ""),
                 outcome=outcome,
@@ -15476,6 +15495,7 @@ class GovernedOrchestrator:
                 terminal_state=state_value,
                 tools_used=_tools,
                 tokens=_tokens,
+                duration_s=_dur_s,
             )
         except Exception:  # noqa: BLE001 — the voice never touches the FSM
             logger.debug(

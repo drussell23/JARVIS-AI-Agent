@@ -39,13 +39,20 @@ from backend.core.ouroboros.governance import shadow_enforce as se
 # ---------------------------------------------------------------------------
 
 
-def test_review_enforce_default_off(monkeypatch: Any) -> None:
+def test_review_enforce_default_on(monkeypatch: Any) -> None:
+    # GRADUATED 2026-09-06: the REVIEW verdict is authoritative by default.
     monkeypatch.delenv("JARVIS_REVIEW_SUBAGENT_ENFORCE", raising=False)
+    assert se.review_enforce_enabled() is True
+    # Explicit off reverts to observer-only shadow.
+    monkeypatch.setenv("JARVIS_REVIEW_SUBAGENT_ENFORCE", "false")
     assert se.review_enforce_enabled() is False
 
 
-def test_plan_enforce_default_off(monkeypatch: Any) -> None:
+def test_plan_enforce_default_on(monkeypatch: Any) -> None:
+    # GRADUATED 2026-09-06: the PLAN DAG is authoritative by default.
     monkeypatch.delenv("JARVIS_PLAN_SUBAGENT_ENFORCE", raising=False)
+    assert se.plan_enforce_enabled() is True
+    monkeypatch.setenv("JARVIS_PLAN_SUBAGENT_ENFORCE", "false")
     assert se.plan_enforce_enabled() is False
 
 
@@ -200,8 +207,9 @@ class _Ctx:
 
 
 def test_plan_should_fanout_off_byte_identical(monkeypatch: Any) -> None:
-    monkeypatch.delenv("JARVIS_PLAN_SUBAGENT_ENFORCE", raising=False)
-    # Even with a perfectly parallelizable DAG, OFF -> no fan-out.
+    # Explicit OFF (post-graduation the default is on) -> no fan-out even with a
+    # perfectly parallelizable DAG.
+    monkeypatch.setenv("JARVIS_PLAN_SUBAGENT_ENFORCE", "false")
     ctx = _Ctx(execution_graph=_multinode_payload())
     assert se.plan_enforce_should_fanout(ctx) is False
 

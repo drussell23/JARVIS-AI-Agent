@@ -51,20 +51,20 @@ def _env_truthy(name: str, default: str = "false") -> bool:
 
 
 def review_enforce_enabled() -> bool:
-    """``JARVIS_REVIEW_SUBAGENT_ENFORCE`` -- default **false**.
-
-    When false, the REVIEW verdict is observer-only (byte-identical shadow).
-    """
-    return _env_truthy("JARVIS_REVIEW_SUBAGENT_ENFORCE")
+    """``JARVIS_REVIEW_SUBAGENT_ENFORCE`` -- GRADUATED 2026-09-06 to default
+    **on**: the REVIEW verdict now gates the FSM authoritatively (REJECT /
+    ambiguous -> APPROVAL_REQUIRED, reservations -> NOTIFY_APPLY) via the same
+    stricter-wins escalation SemanticGuardian uses. Set to ``false`` to revert
+    to observer-only (byte-identical shadow)."""
+    return _env_truthy("JARVIS_REVIEW_SUBAGENT_ENFORCE", "true")
 
 
 def plan_enforce_enabled() -> bool:
-    """``JARVIS_PLAN_SUBAGENT_ENFORCE`` -- default **false**.
-
-    When false, the PLAN DAG is stashed but the flat plan stays authoritative
-    (byte-identical shadow).
-    """
-    return _env_truthy("JARVIS_PLAN_SUBAGENT_ENFORCE")
+    """``JARVIS_PLAN_SUBAGENT_ENFORCE`` -- GRADUATED 2026-09-06 to default
+    **on**: the PLAN subagent's multi-node DAG is authoritative and drives the
+    post-GENERATE fan-out. Set to ``false`` to keep the flat plan authoritative
+    (byte-identical shadow)."""
+    return _env_truthy("JARVIS_PLAN_SUBAGENT_ENFORCE", "true")
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +172,85 @@ def escalate_risk_tier(current: Any, floor_name: Optional[str]) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# REVIEW authorize -- a CLEAN approve DOWN-levels a ROUTINE approval gate.
+# ---------------------------------------------------------------------------
+#
+# The inverse of escalate_risk_tier, and the ONLY place in this module that can
+# LOWER friction. It exists so a graduated REVIEW subagent can authorize the
+# VERIFY->APPLY transition autonomously -- but STRICTLY for routine blast-radius
+# tasks (Option 1). Every clause is fail-CLOSED: it can only turn an
+# APPROVAL_REQUIRED that a HARD gate did not demand into NOTIFY_APPLY (auto-apply
+# WITH a diff notice -- never a silent SAFE_AUTO), and only on a unanimous, clean,
+# failure-free approve. A hard BLOCK, a SemanticGuardian finding, the
+# self-modification cage, an operator risk floor, or ANY ambiguity leaves the
+# tier exactly where the safety layers put it.
+
+
+def apply_downlevel_enabled() -> bool:
+    """``JARVIS_SUBAGENT_APPLY_AUTHORIZE`` -- graduated 2026-09-06 to default
+    **on**. When on, a CLEAN unanimous REVIEW approve can down-level a
+    ROUTINE-risk ``APPROVAL_REQUIRED`` to ``NOTIFY_APPLY`` (auto-apply with a
+    diff notice), authorizing VERIFY->APPLY without a human -- but ONLY when no
+    hard gate imposed the tier (the caller proves that). Set to ``false`` to
+    require a human on every APPROVAL_REQUIRED op."""
+    return _env_truthy("JARVIS_SUBAGENT_APPLY_AUTHORIZE", "true")
+
+
+def review_is_clean_approve(agg: "Optional[ReviewAggregate]") -> bool:
+    """True ONLY for an unambiguous, failure-free, unanimous APPROVE: at least
+    one file reviewed, zero rejects, zero reservations, zero failed reviews.
+    This is the sole verdict shape that may authorize an autonomous apply.
+    NEVER raises."""
+    try:
+        if agg is None:
+            return False
+        return (
+            agg.aggregate == AGG_APPROVE
+            and not agg.had_failure
+            and agg.failed == 0
+            and agg.rejected == 0
+            and agg.reservations == 0
+            and agg.files_reviewed >= 1
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def authorize_apply_downlevel(
+    current: Any,
+    review_agg: "Optional[ReviewAggregate]",
+    *,
+    hard_gate_present: bool,
+) -> Any:
+    """Down-level a ROUTINE ``APPROVAL_REQUIRED`` to ``NOTIFY_APPLY`` when a
+    graduated REVIEW subagent cleanly approved and NO hard gate demanded the
+    tier. Returns the (possibly-lowered) ``RiskTier``. Fail-CLOSED on EVERY
+    branch -- the flag off, a hard gate present, a non-clean verdict, a
+    non-``APPROVAL_REQUIRED`` tier (never touches ``BLOCKED`` or an already-auto
+    tier), or any error leaves ``current`` unchanged. It NEVER lowers below
+    ``NOTIFY_APPLY``, so the diff is always surfaced; it is authorization, not a
+    bypass of the apply machinery. NEVER raises."""
+    try:
+        if not apply_downlevel_enabled():
+            return current
+        # A hard gate (SemanticGuardian / cage / mutation / M10 / Layer4 /
+        # operator floor / provenance ceiling) OWNS this tier -- a subagent may
+        # never reason around it. This is the Option-1 invariant.
+        if hard_gate_present:
+            return current
+        if not review_is_clean_approve(review_agg):
+            return current
+        from backend.core.ouroboros.governance.risk_engine import RiskTier
+        if current is None or getattr(current, "name", "") != "APPROVAL_REQUIRED":
+            return current  # only a routine approval gate is down-levellable
+        return RiskTier.NOTIFY_APPLY
+    except Exception:  # noqa: BLE001 -- a down-level fault must FAIL CLOSED
+        logger.debug("[ShadowEnforce] apply down-level skipped (fail-closed)",
+                     exc_info=True)
+        return current
+
+
+# ---------------------------------------------------------------------------
 # PLAN enforce -- decide whether the PLAN DAG is authoritative + multi-node.
 # ---------------------------------------------------------------------------
 
@@ -259,6 +338,9 @@ __all__ = [
     "ReviewAggregate",
     "aggregate_to_tier_floor",
     "escalate_risk_tier",
+    "apply_downlevel_enabled",
+    "review_is_clean_approve",
+    "authorize_apply_downlevel",
     "plan_dag_is_multinode",
     "plan_enforce_should_fanout",
     "AGG_APPROVE",

@@ -5003,15 +5003,39 @@ class GovernedLoopService:
                 def __init__(self, gls: "GovernedLoopService") -> None:
                     self._gls = gls
 
+                def _comm(self) -> Any:
+                    """The CommProtocol this service actually holds, or None.
+
+                    ONE resolver for both entry points, so they cannot name
+                    two different attributes. They did: this proxy read
+                    ``self._gls._governance_stack``, an attribute that has
+                    never existed on GovernedLoopService — the stack is
+                    ``self._stack`` (assigned in ``__init__``). ``getattr``
+                    with a default made the mistake silent: every tool
+                    narration message resolved to no comm, ``_emit``
+                    returned before touching a transport, and nothing was
+                    counted as a failure because nothing had failed. The
+                    cockpit showed intent lines (emitted by the orchestrator
+                    through the real comm) and never a single tool call.
+                    Measured 2026-09-06: 8 tool rounds in a 240 s window,
+                    0 tool blocks on the socket, 0 recorded failures.
+
+                    Resolved late and by the REAL name, with no default that
+                    could hide a rename: a missing stack raises here, is
+                    caught by the channel's own fault isolation, and is
+                    COUNTED — which is the difference between a defect the
+                    next reader can see and one that hides for months.
+                    """
+                    stack = self._gls._stack
+                    return getattr(stack, "comm", None) if stack is not None else None
+
                 @property
                 def _transports(self) -> Any:
-                    _comm = getattr(self._gls, "_governance_stack", None)
-                    _comm = getattr(_comm, "comm", None) if _comm is not None else None
+                    _comm = self._comm()
                     return getattr(_comm, "_transports", []) if _comm is not None else []
 
                 async def _emit(self, msg: Any) -> None:
-                    _gov = getattr(self._gls, "_governance_stack", None)
-                    _comm = getattr(_gov, "comm", None) if _gov is not None else None
+                    _comm = self._comm()
                     if _comm is None:
                         return
                     _emit_fn = getattr(_comm, "_emit", None)

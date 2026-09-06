@@ -742,6 +742,7 @@ class ClaudeStyleTransport:
             # Prefer the model's sentence; a bare "noop" code says nothing
             # the lead line did not.
             self._print_detail(words or (code if code != "noop" else ""))
+            self._emit_recap(state, elapsed, payload)
             return
 
         if outcome == "cancelled":
@@ -772,6 +773,7 @@ class ClaudeStyleTransport:
             tail += f" [dim]{sep} {elapsed}[/dim]"
             self._safe_print(self._lead(OpStatusGlyph.RUNNING, state, tail=tail))
             self._print_detail(words)
+            self._emit_recap(state, elapsed, payload)
             return
 
         # Unknown outcome — record state cleared but emit nothing

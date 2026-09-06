@@ -178,8 +178,100 @@ def owns_inflight_publishing(name: str) -> bool:
     return _INFLIGHT_PUBLISHER is None or _INFLIGHT_PUBLISHER == name
 
 
+#: The organism's activity vocabulary while it generates — its analogue of
+#: Claude Code's rotating word. DATA, not a threshold: a small closed set of
+#: gerunds that fit an autonomous coding organism. One is chosen per op
+#: (stable for that op, varied across ops), so consecutive generations do
+#: not read as a stuck spinner. Operators may override the whole set with a
+#: comma list in ``JARVIS_THINKING_WORDS``.
+_THINKING_WORDS: "tuple" = (
+    "Synthesizing", "Reasoning", "Composing", "Weaving", "Deliberating",
+    "Iterating", "Architecting", "Ruminating",
+)
+
+
+def thinking_words() -> "tuple":
+    raw = os.environ.get("JARVIS_THINKING_WORDS", "").strip()
+    if raw:
+        words = tuple(w.strip() for w in raw.split(",") if w.strip())
+        if words:
+            return words
+    return _THINKING_WORDS
+
+
+def thinking_word(op_id: str) -> str:
+    """A stable-per-op activity gerund. Deterministic on the op id so one
+    generation keeps one word and the next differs. NEVER raises."""
+    words = thinking_words()
+    try:
+        import hashlib  # noqa: PLC0415
+        h = int(hashlib.sha1(str(op_id or "op").encode()).hexdigest()[:8], 16)
+        return words[h % len(words)]
+    except Exception:  # noqa: BLE001
+        return words[0]
+
+
+def _fmt_elapsed(elapsed_s: float) -> str:
+    e = max(0.0, float(elapsed_s or 0.0))
+    if e < 60:
+        return f"{int(e)}s"
+    if e < 3600:
+        return f"{int(e // 60)}m {int(e % 60):02d}s"
+    return f"{int(e // 3600)}h {int((e % 3600) // 60):02d}m"
+
+
+def _fmt_tokens(tokens: int) -> str:
+    t = max(0, int(tokens or 0))
+    if t < 1000:
+        return str(t)
+    return f"{t / 1000.0:.1f}k"
+
+
+def thinking_indicator_enabled() -> bool:
+    """Whether MODEL generation shows the compact self-clearing indicator
+    (``· Synthesizing… (2m 14s · ↓ 8.2k tokens)``) instead of streaming the
+    raw JSON candidate into the strip. Default ON — the raw candidate reads
+    as noise. ``JARVIS_COCKPIT_THINKING_INDICATOR_ENABLED=false`` restores the
+    legacy raw-stream rendering (hot-revert, byte-identical)."""
+    return os.environ.get(
+        "JARVIS_COCKPIT_THINKING_INDICATOR_ENABLED", "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def thinking_still_after_s() -> float:
+    """When a generation has run this long, the indicator says 'still
+    thinking' so a slow model reads as WORKING, not stalled. Env-tunable."""
+    try:
+        return max(1.0, float(os.environ.get("JARVIS_THINKING_STILL_AFTER_S", "20")))
+    except (TypeError, ValueError):
+        return 20.0
+
+
+def render_thinking_indicator(*, word: str, elapsed_s: float, tokens: int,
+                              still_after_s: "Optional[float]" = None) -> str:
+    """The compact, self-clearing 'the model is generating' line — O+V's
+    analogue of Claude Code's ``· Clauding… (2m 14s · ↓ 8.2k tokens · still
+    thinking)``. Shown above the prompt while a generation is in flight and
+    gone the instant it ends. Pure, NEVER raises.
+
+    Deliberately NOT the raw generated text: the organism generates a JSON
+    code candidate, and streaming that verbatim reads as noise. What the
+    operator wants is TRANSPARENCY — that it is working, for how long, and
+    how much has come back — which is exactly this line."""
+    try:
+        w = str(word or "Thinking").strip() or "Thinking"
+        still = thinking_still_after_s() if still_after_s is None else still_after_s
+        parts = [_fmt_elapsed(elapsed_s), f"↓ {_fmt_tokens(tokens)} tokens"]
+        if float(elapsed_s or 0.0) >= still:
+            parts.append("still thinking")
+        return f"· {w}… ({' · '.join(parts)})"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def publish_inflight_tail(op_id: str, tail: str, *, done: bool = False,
-                          sink: "Optional[Any]" = None) -> bool:
+                          sink: "Optional[Any]" = None,
+                          tokens: int = 0, provider: str = "") -> bool:
     """The ONE producer of the ``stream_inflight`` frame.
 
     Carried on the telemetry lane rather than the markup lane because it is
@@ -204,6 +296,11 @@ def publish_inflight_tail(op_id: str, tail: str, *, done: bool = False,
         "op_id": str(op_id or ""),
         "text": "" if done else str(tail or "")[-_INFLIGHT_MAX_CHARS:],
         "done": bool(done),
+        # Progress the client renders as a compact indicator (tokens so far,
+        # which model). The raw text still rides for any surface that wants
+        # it, but the cockpit reads these.
+        "tokens": max(0, int(tokens or 0)),
+        "provider": str(provider or ""),
     }
     try:
         from backend.core.ouroboros.battle_test.inflight_registry import (  # noqa: E501,PLC0415

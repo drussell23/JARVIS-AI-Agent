@@ -76,12 +76,14 @@ def wire(monkeypatch):
 
 
 def test_the_inflight_frame_has_one_producer(wire):
-    assert sr.publish_inflight_tail("op-1", "the model is writ", done=False) is True
+    assert sr.publish_inflight_tail(
+        "op-1", "the model is writ", done=False, tokens=12, provider="local") is True
     assert sr.publish_inflight_tail("op-1", "ignored", done=True) is True
-    assert wire == [
-        {"kind": "stream_inflight", "op_id": "op-1", "text": "the model is writ", "done": False},
-        {"kind": "stream_inflight", "op_id": "op-1", "text": "", "done": True},
-    ]
+    assert [f["kind"] for f in wire] == ["stream_inflight", "stream_inflight"]
+    assert wire[0] == {"kind": "stream_inflight", "op_id": "op-1",
+                       "text": "the model is writ", "done": False,
+                       "tokens": 12, "provider": "local"}
+    assert wire[1]["done"] is True and wire[1]["text"] == "" and wire[1]["tokens"] == 0
 
 
 def test_the_tail_is_capped_to_the_renderer_budget(wire):
@@ -117,15 +119,19 @@ async def test_the_first_token_goes_out_at_once_and_the_rest_coalesce(wire, monk
     t = cst.ClaudeStyleTransport(console=_Console())
     t.telemetry_mirror = lambda frame: wire.append(dict(frame))
     t.notify(_event("PHASE_BEGIN", "op-1", provider="local"))
+    assert [f["text"] for f in wire] == [""]              # opening frame, 0 tokens
+    assert wire[0]["tokens"] == 0 and wire[0]["provider"] == "local"
     t.notify(_event("REASONING_TOKEN", "op-1", "I "))
-    assert [f["text"] for f in wire] == ["I "]            # instant
+    assert [f["text"] for f in wire] == ["", "I "]        # first token, instant
+    assert wire[-1]["tokens"] == 1
     t.notify(_event("REASONING_TOKEN", "op-1", "will "))
     t.notify(_event("REASONING_TOKEN", "op-1", "read "))
-    assert len(wire) == 1                                  # inside the window
+    assert len(wire) == 2                                  # inside the window
     await asyncio.sleep(0.3)                               # the trailing flush
-    assert wire[-1]["text"] == "I will read " and len(wire) == 2
+    assert wire[-1]["text"] == "I will read " and len(wire) == 3
+    assert wire[-1]["tokens"] == 3
     t.notify(_event("PHASE_END", "op-1"))
-    assert wire[-1] == {"kind": "stream_inflight", "op_id": "op-1", "text": "", "done": True}
+    assert wire[-1]["done"] is True and wire[-1]["text"] == "" and wire[-1]["op_id"] == "op-1"
     assert "op-1" not in t._streams
 
 
@@ -221,7 +227,9 @@ async def test_a_reasoning_stream_reaches_the_cockpit_through_the_transport(monk
     await asyncio.sleep(0.02)
     cb.end_callback()
     texts = [f["text"] for f in seen]
-    assert texts[0] == "Reading " and "Reading the callers" in texts
+    assert texts[0] == ""                                 # opening frame first
+    assert "Reading " in texts and "Reading the callers" in texts
+    assert all(f.get("provider") == "local" for f in seen if not f["done"])
     assert seen[-1]["done"] is True and seen[-1]["op_id"] == "op-9"
 
 
@@ -285,3 +293,35 @@ def test_every_local_generation_closes_its_stream_on_every_path():
     src = inspect.getsource(pv.PrimeProvider._generate_impl)
     assert src.count("_local_stream_kw(") == 2
     assert src.count("_end_local_stream(_stream_kw)") == 3   # error path, success path, finally
+
+
+# ---------------------------------------------------------------------------
+# The compact "thinking" indicator (Claude-Code-style), not the raw JSON
+# ---------------------------------------------------------------------------
+
+
+def test_the_thinking_indicator_reads_like_claude_code(monkeypatch):
+    monkeypatch.delenv("JARVIS_THINKING_STILL_AFTER_S", raising=False)
+    line = sr.render_thinking_indicator(word="Synthesizing", elapsed_s=134, tokens=8200)
+    assert line == "· Synthesizing… (2m 14s · ↓ 8.2k tokens · still thinking)"
+    short = sr.render_thinking_indicator(word="Reasoning", elapsed_s=3, tokens=42)
+    assert short == "· Reasoning… (3s · ↓ 42 tokens)"          # no "still thinking" yet
+
+
+def test_the_activity_word_is_stable_per_op_and_varies_across_ops():
+    a1 = sr.thinking_word("op-aaaa")
+    a2 = sr.thinking_word("op-aaaa")
+    assert a1 == a2 and a1 in sr.thinking_words()               # stable for one op
+    words = {sr.thinking_word(f"op-{i}") for i in range(40)}
+    assert len(words) > 1                                        # varies across ops
+
+
+def test_the_word_set_is_operator_overridable(monkeypatch):
+    monkeypatch.setenv("JARVIS_THINKING_WORDS", "Cooking, Brewing")
+    assert set(sr.thinking_words()) == {"Cooking", "Brewing"}
+    assert sr.thinking_word("op-x") in ("Cooking", "Brewing")
+
+
+def test_the_indicator_never_raises_on_junk():
+    assert isinstance(sr.render_thinking_indicator(word="", elapsed_s=-1, tokens=-5), str)
+    assert isinstance(sr.thinking_word(None), str)

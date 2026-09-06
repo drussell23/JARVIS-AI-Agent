@@ -1217,6 +1217,19 @@ class AttachUI:
         #: Is the strip currently showing COMMAND output rather than model
         #: prose? Decides whether line breaks are content or artefact.
         self._stream_is_tool: bool = False
+        #: Live generation progress for the compact "thinking" indicator.
+        #: The organism generates a JSON code candidate; streaming that
+        #: verbatim reads as noise, so for MODEL generation the cockpit shows
+        #: a self-clearing "· Synthesizing… (2m 14s · ↓ 8.2k tokens)" line
+        #: instead of the raw text. These carry what that line needs.
+        self._stream_op: str = ""
+        self._stream_tokens: int = 0
+        self._stream_provider: str = ""
+        self._stream_started: float = 0.0
+        #: The model the daemon RESOLVED, from hydration — named persistently
+        #: beside the key hints. Client-side only for RENDER; the daemon is
+        #: the single source of truth (a client cannot load `.env`).
+        self._model: str = ""
         self._focus_lines: List[str] = []
         self._focus_note: str = ""
         self._flash_text: str = ""
@@ -1842,7 +1855,18 @@ class AttachUI:
             mux = getattr(self, "_mux", None)
             if mux is None or not hasattr(mux, "set_streaming_tail"):
                 return
-            mux.set_streaming_tail(self._stream_inflight or "")
+            # A model generation is a JSON candidate; with the compact
+            # indicator on (default), its raw text does not belong in the
+            # deck — the strip shows the indicator instead, and only a TOOL
+            # tail is deck content. Flag off restores the legacy raw stream.
+            from backend.core.ouroboros.battle_test.stream_renderer import (
+                thinking_indicator_enabled,
+            )
+            if thinking_indicator_enabled() and not self._stream_is_tool:
+                tail = ""
+            else:
+                tail = self._stream_inflight
+            mux.set_streaming_tail(tail or "")
         except Exception:  # noqa: BLE001
             pass
 
@@ -1891,6 +1915,36 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return []
 
+    def set_model(self, model: object) -> None:
+        """Record the model the daemon named in its hydration frame. NEVER
+        raises; an empty value leaves the last known name in place rather
+        than blanking a name that was correct a moment ago."""
+        try:
+            m = str(model or "").strip()
+            if m:
+                self._model = m
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _thinking_line(self) -> str:
+        """The compact, self-clearing generation indicator — O+V's analogue
+        of Claude Code's ``· Clauding… (2m 14s · ↓ 8.2k tokens)``. Recomputed
+        each repaint so the clock ticks between token frames. NEVER raises."""
+        try:
+            import time as _time
+            from backend.core.ouroboros.battle_test.stream_renderer import (
+                render_thinking_indicator, thinking_word,
+            )
+            started = self._stream_started or self._stream_arrived
+            elapsed = max(0.0, _time.monotonic() - float(started or _time.monotonic()))
+            line = render_thinking_indicator(
+                word=thinking_word(self._stream_op),
+                elapsed_s=elapsed, tokens=int(self._stream_tokens or 0),
+            )
+            return f"[dim]{line}[/dim]" if line else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _stream_rows(self) -> List[str]:
         """The in-flight sentence, wrapped to THIS terminal. NEVER raises.
 
@@ -1915,25 +1969,34 @@ class AttachUI:
             from backend.core.ouroboros.battle_test.stream_renderer import (
                 render_inflight,
             )
+            # MODEL generation: a compact indicator, above the prompt, that
+            # ticks through the model's cold-load gap (before the first
+            # token) and vanishes the instant the generation ends. Gated on
+            # the DAEMON's heartbeat, not on the last token frame, so a slow
+            # model reads as WORKING rather than lapsing to blank — and a
+            # DEAD daemon still clears it on the shared "lost contact" window.
+            from backend.core.ouroboros.battle_test.stream_renderer import (
+                thinking_indicator_enabled,
+            )
+            if not self._stream_is_tool and thinking_indicator_enabled():
+                if not self._stream_op:
+                    return []
+                hb = self._heartbeat_age()
+                if hb is None or hb > heartbeat_stale_after_s():
+                    return []
+                line = self._thinking_line()
+                return [line] if line else []
+            # TOOL output (or legacy raw model stream): the live tail, deck-first.
             if not self._stream_inflight or not self._stream_arrived:
                 return []
             age = max(0.0, _time.monotonic() - float(self._stream_arrived))
             if age > heartbeat_stale_after_s():
                 return []
-            # When the deck can carry the tail itself, the strip stands
-            # down: rendering the same text twice is worse than either
-            # placement alone. The deck is the better home — the words
-            # appear where they will come to rest.
             if self._deck_carries_tail():
                 return []
             return render_inflight(
                 self._stream_inflight, width=self._terminal_size()[0],
-                # Command output keeps its line structure; model prose does
-                # not. The producer is known from the frame that set it.
                 preserve_lines=self._stream_is_tool,
-                # Row 0 of a tool tail is `$ bash · 11s` — what is running
-                # and for how long. Eliding it leaves test names with no
-                # subject.
                 keep_first=self._stream_is_tool)
         except Exception:  # noqa: BLE001
             return []
@@ -2122,7 +2185,17 @@ class AttachUI:
         # dedicated verb (`ov doctor`) that recovers the full detail.
         badge = f"{badge} · {health}" if badge and health else (badge or health)
         head = f"{badge} · " if badge else ""
-        return f"{head}{audio.lstrip(' ·')}{keys} · 'detach' to leave"
+        # WHICH MODEL is answering, named persistently at the head of the
+        # affordance line — Claude Code shows the model at all times, and on
+        # a local lane it is the one thing that changes between sessions
+        # (base vs fine-tune). From the daemon's hydration frame, never the
+        # client's environment. Silent until the daemon has named one.
+        model_seg = (
+            f"[{_SEM['neural']}]{self._model}[/{_SEM['neural']}] · "
+            if getattr(self, "_model", "") else ""
+        )
+        return (f"{model_seg}{head}{audio.lstrip(' ·')}{keys} "
+                f"· 'detach' to leave")
 
     def _mode_lines(self) -> Optional[List[str]]:
         """SELECT / FOCUS rendering, or None to fall through to the deck.
@@ -2253,11 +2326,19 @@ class AttachUI:
                 # last frame wins outright — no accumulation to drift, and a
                 # dropped frame costs one tick of smoothness rather than a
                 # word. `done` clears it: everything is in the deck by then.
-                self._stream_inflight = (
-                    "" if frame.get("done") else str(frame.get("text") or "")
-                )
-                self._stream_is_tool = False
                 import time as _time
+                _done = bool(frame.get("done"))
+                _op = str(frame.get("op_id") or "")
+                # A new op (or the first frame after idle) restarts the clock.
+                if not _done and _op and _op != self._stream_op:
+                    self._stream_started = _time.monotonic()
+                self._stream_op = "" if _done else _op
+                self._stream_inflight = (
+                    "" if _done else str(frame.get("text") or "")
+                )
+                self._stream_tokens = 0 if _done else int(frame.get("tokens") or 0)
+                self._stream_provider = str(frame.get("provider") or "")
+                self._stream_is_tool = False
                 self._stream_arrived = _time.monotonic()
                 self._push_tail_to_deck()
             elif isinstance(frame, dict) and frame.get(
@@ -4554,6 +4635,10 @@ def run_attach(console: Any) -> int:
 
         def _on_hydration(payload: dict) -> None:
             _render_hydration(console, payload)
+            try:
+                ui.set_model(payload.get("model"))
+            except Exception:  # noqa: BLE001
+                pass
             # Health, from the SAME frame — the doctor's own verdicts on the
             # bytes already in hand. No second probe, no second thresholds,
             # so the line and `ov doctor` cannot disagree.

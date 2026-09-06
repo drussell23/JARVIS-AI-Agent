@@ -403,8 +403,18 @@ def render_to_printer(
                 if str(getattr(frame, "provider", "") or "").lower() == "synthetic"
                 else Provenance.MODELED
             )
+            # The footing is always DECLARED (so downstream honesty holds and
+            # the AST pin sees `claiming`), but the visible trailing mark is
+            # emitted only when it ADDS something. For a MODELED line the 💭 /
+            # voice glyph IS the mark that a model is speaking, so a trailing
+            # ‹model› on every line is redundant — and, degraded to `<model>`
+            # on an ASCII terminal, reads as a broken placeholder (the exact
+            # confusion an operator reported). Synthetic/unknown footings,
+            # where the reader could otherwise mistake a template or an
+            # unanswered value for the model's own words, still carry it.
             with claiming(_footing) as resolved:
-                markup = annotate(markup, resolved)
+                if _footing is not Provenance.MODELED:
+                    markup = annotate(markup, resolved)
         except Exception:  # noqa: BLE001 — an unmarked line beats no line
             markup = rendered.markup
         print_fn(markup, highlight=False)

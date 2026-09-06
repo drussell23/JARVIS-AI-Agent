@@ -1068,11 +1068,16 @@ class ClaudeStyleTransport:
         prior = self._streams.pop(op_id, None)
         if prior is not None:
             self._cancel_flush(prior)
-        self._streams[op_id] = _StreamState(op_id=op_id, provider=provider)
+        state = _StreamState(op_id=op_id, provider=provider)
+        self._streams[op_id] = state
         logger.info(
             "[claude_style_transport] stream begin op=%s provider=%s "
             "(carrying the token tail to cockpits)", op_id, provider,
         )
+        # An opening frame (0 tokens) so the cockpit's thinking indicator
+        # appears the instant generation starts and ticks through the cold
+        # load, not only once the first token lands.
+        self._stream_flush(op_id)
 
     def _stream_token(self, op_id: str, content: str) -> None:
         """Append one token and carry the tail to cockpits, coalesced.
@@ -1118,6 +1123,7 @@ class ClaudeStyleTransport:
             )
             publish_inflight_tail(
                 op_id, state.text, done=done, sink=self.telemetry_mirror,
+                tokens=state.tokens, provider=state.provider,
             )
         except Exception:  # noqa: BLE001 — a dropped frame is a frame of smoothness
             logger.debug("[claude_style_transport] inflight publish degraded",

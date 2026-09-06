@@ -13,6 +13,14 @@ from __future__ import annotations
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _legacy_raw_stream(monkeypatch):
+    """This file pins the LEGACY raw in-flight stream rendering. The compact
+    thinking indicator (default-on) is covered in test_cockpit_stream.py."""
+    monkeypatch.setenv("JARVIS_COCKPIT_THINKING_INDICATOR_ENABLED", "false")
+    yield
+
 from backend.core.ouroboros.battle_test.split_layout import RegionBuffer
 
 

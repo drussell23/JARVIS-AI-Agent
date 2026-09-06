@@ -221,14 +221,9 @@ class TestTheProducerSeam:
             StreamRenderer,
         )
 
-        target = getattr(StreamRenderer, "_publish_inflight", None)
-        if target is None:                       # method renamed — find it
-            import inspect
-            for _n, m in inspect.getmembers(StreamRenderer, inspect.isfunction):
-                if "publish_telemetry_global" in inspect.getsource(m):
-                    target = m
-                    break
-        assert target is not None, "no method publishes an in-flight frame"
+        from backend.core.ouroboros.battle_test import stream_renderer as _sr
+        target = getattr(_sr, "publish_inflight_tail", None)
+        assert target is not None, "no seam publishes an in-flight frame"
         assert (self._first_line_of_call(target, "note_inflight_frame")
                 < self._first_line_of_call(target, "publish_telemetry_global"))
 

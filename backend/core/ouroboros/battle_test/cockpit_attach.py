@@ -1986,6 +1986,8 @@ class CockpitAttachClient:
             import signal
             if not hasattr(signal, "SIGWINCH"):
                 return False            # Windows / no job control
+            if getattr(self, "_resize_installed", False):
+                return True             # already chained -- do not stack
             prior = signal.getsignal(signal.SIGWINCH)
 
             def _on_resize(signum, frame) -> None:
@@ -2000,6 +2002,7 @@ class CockpitAttachClient:
                         pass
 
             signal.signal(signal.SIGWINCH, _on_resize)
+            self._resize_installed = True
             return True
         except (ValueError, OSError, AttributeError):
             # `signal.signal` off the main thread raises ValueError — a real

@@ -15451,6 +15451,20 @@ class GovernedOrchestrator:
                 return
             if not words and isinstance(data, dict):
                 words = str(data.get("detail") or "")
+            # Recap counts, synthesised from THIS op's execution ledger, so
+            # the transport can draw the "✻ Crunched for … · N tools · done …"
+            # line without re-deriving them. Best-effort; a missing generation
+            # simply yields zeros, which the recap drops rather than prints.
+            _tools = _tokens = 0
+            try:
+                from backend.core.ouroboros.governance.op_recap import (
+                    output_tokens as _rc_tokens,
+                    tool_count as _rc_tools,
+                )
+                _tools = _rc_tools(generation)
+                _tokens = _rc_tokens(generation)
+            except Exception:  # noqa: BLE001
+                pass
             await comm.emit_decision(
                 op_id=str(getattr(ctx, "op_id", "") or ""),
                 outcome=outcome,
@@ -15460,6 +15474,8 @@ class GovernedOrchestrator:
                 ],
                 reason=words,
                 terminal_state=state_value,
+                tools_used=_tools,
+                tokens=_tokens,
             )
         except Exception:  # noqa: BLE001 — the voice never touches the FSM
             logger.debug(

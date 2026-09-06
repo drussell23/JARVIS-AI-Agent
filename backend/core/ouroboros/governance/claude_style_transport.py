@@ -719,6 +719,7 @@ class ClaudeStyleTransport:
             tail += "[/dim]"
             self._safe_print(self._lead(OpStatusGlyph.DONE, state, tail=tail))
             self._print_detail(words)
+            self._emit_recap(state, elapsed, payload)
             self._done_count += 1
             self._feed_composer()
             return
@@ -730,6 +731,7 @@ class ClaudeStyleTransport:
             tail += f" [dim]{sep} {elapsed}[/dim]"
             self._safe_print(self._lead(OpStatusGlyph.FAILED, state, tail=tail))
             self._print_detail(words)
+            self._emit_recap(state, elapsed, payload, failed=True)
             self._failed_count += 1
             self._feed_composer()
             return
@@ -749,6 +751,7 @@ class ClaudeStyleTransport:
             tail += f" {sep} {elapsed}[/dim]"
             self._safe_print(self._lead(OpStatusGlyph.CANCELLED, state, tail=tail))
             self._print_detail(words)
+            self._emit_recap(state, elapsed, payload, aborted=True)
             return
 
         if outcome == "notify_apply":
@@ -870,6 +873,33 @@ class ClaudeStyleTransport:
         if state.summary:
             head += f" {sep} {_escape(state.summary)}"
         return head + tail
+
+    def _emit_recap(self, state: "_OpState", elapsed: str, payload: Dict[str, Any],
+                    *, aborted: bool = False, failed: bool = False) -> None:
+        """The one-line op recap beneath the outcome — Claude Code's
+        ``✻ Crunched for 2m 14s · 3 tools used · done 11:40 PM``. Synthesised
+        from the terminal decision's counts. Dim, so the outcome color leads.
+        NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.op_recap import (
+                compose_recap, recap_enabled, recap_verb,
+            )
+            if not recap_enabled():
+                return
+            def _int(key: str) -> int:
+                try:
+                    return max(0, int(payload.get(key, 0) or 0))
+                except (TypeError, ValueError):
+                    return 0
+            line = compose_recap(
+                elapsed=elapsed, verb=recap_verb(state.op_id),
+                tools=_int("tools_used"), tokens=_int("tokens"),
+                aborted=aborted, failed=failed,
+            )
+            if line:
+                self._safe_print(f"    [{_SEM['dim']}]{_escape(line)}[/{_SEM['dim']}]")
+        except Exception:  # noqa: BLE001
+            logger.debug("[claude_style_transport] recap degraded", exc_info=True)
 
     def _print_detail(self, text: object) -> None:
         """The model's own words beneath an outcome line: wrapped to the

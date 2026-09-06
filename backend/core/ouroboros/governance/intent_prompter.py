@@ -302,18 +302,27 @@ async def request_intent(
         except GateProviderExhaustedError as exc:
             raise RuntimeError(f"rt gate exhausted: {exc}")
 
+    # Failures are logged at INFO, not DEBUG: a session in which the
+    # organism's voice went missing must be able to say WHY (2026-09-06:
+    # two of five intents rendered nothing and the log could not tell a
+    # timeout from an empty answer).
     try:
         prose = await asyncio.wait_for(_call(), timeout=eff_timeout)
     except asyncio.TimeoutError:
+        logger.info(
+            "[IntentPrompter] intent for op=%s timed out after %.1fs "
+            "(budget %s=%.1fs)", req.op_id, time.monotonic() - started,
+            TIMEOUT_ENV_VAR, eff_timeout,
+        )
         return IntentResult(
             prose="", provider="doubleword",
             elapsed_s=time.monotonic() - started,
             error="timeout",
         )
     except Exception as exc:  # noqa: BLE001
-        logger.debug(
-            "[IntentPrompter] call failed for op=%s: %s",
-            req.op_id, exc, exc_info=True,
+        logger.info(
+            "[IntentPrompter] intent for op=%s failed after %.1fs: %s",
+            req.op_id, time.monotonic() - started, exc,
         )
         return IntentResult(
             prose="", provider="doubleword",
@@ -323,6 +332,10 @@ async def request_intent(
 
     prose_safe = (prose or "").strip()
     if not prose_safe:
+        logger.info(
+            "[IntentPrompter] intent for op=%s came back empty after %.1fs",
+            req.op_id, time.monotonic() - started,
+        )
         return IntentResult(
             prose="", provider="doubleword",
             elapsed_s=time.monotonic() - started,

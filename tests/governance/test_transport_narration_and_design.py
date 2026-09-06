@@ -335,6 +335,32 @@ async def test_the_models_reason_is_bounded_in_height(monkeypatch):
     ) or detail[-1].count(theme.mark("ellipsis")) == 1
 
 
+@pytest.mark.asyncio
+async def test_an_op_held_before_it_announced_itself_still_renders():
+    """Sixteen ops blocked at the gate never emitted INTENT; their terminal
+    DECISION arrived with no state and vanished as a boot orphan."""
+    t, console, _ = _transport()
+    await t.send(_msg("DECISION", "op-held", {
+        "outcome": "escalated", "reason_code": "touches_kernel",
+        "target_files": ["unified_supervisor.py"], "terminal_state": "blocked",
+    }))
+    assert len(console.prints) == 1
+    line = console.prints[0]
+    assert "held for review" in line and "touches kernel" in line
+    assert "unified_supervisor.py" in line
+
+
+@pytest.mark.asyncio
+async def test_a_boot_orphan_decision_is_still_suppressed():
+    t, console, _ = _transport()
+    await t.send(_msg("DECISION", "op-ghost", {"outcome": "failed"}))
+    await t.send(_msg("DECISION", "op-ghost2", {
+        "outcome": "failed", "reason_code": "boot_recovery_orphan",
+        "terminal_state": "failed",
+    }))
+    assert console.prints == []
+
+
 def test_summaries_cut_at_a_word_with_the_theme_ellipsis():
     goal = "graduate the wave three sensors after the audit lands"
     s = cst._clip_words(goal, 30)

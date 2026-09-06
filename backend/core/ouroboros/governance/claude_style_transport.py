@@ -623,9 +623,11 @@ class ClaudeStyleTransport:
         outcome = str(payload.get("outcome", "") or "").lower()
         state = self._op_state.pop(op_id, None)
         if state is None:
-            # Decision without prior INTENT — common at boot for
-            # orphan reconciliation. Suppress.
-            return
+            state = self._state_for_unannounced(op_id, payload)
+            if state is None:
+                # Decision without prior INTENT and without a terminal
+                # stamp — boot-time orphan reconciliation. Suppress.
+                return
         elapsed = _format_elapsed(state.started_monotonic)
         sep = _theme.mark("dot")
         code = _humanise(payload.get("reason_code", ""))
@@ -757,6 +759,34 @@ class ClaudeStyleTransport:
     def _summarize(self, payload: Dict[str, Any]) -> str:
         """One line of the op's goal, cut at a word to the line budget."""
         return _clip_words(payload.get("goal", ""), line_chars())
+
+    def _state_for_unannounced(
+        self, op_id: str, payload: Dict[str, Any],
+    ) -> Optional[_OpState]:
+        """An op the gate held BEFORE it ever announced itself.
+
+        Measured 2026-09-06 (bt-2026-09-06-074921): sixteen ops reached
+        the ledger as ``blocked`` — ``touches_kernel`` on
+        ``unified_supervisor.py``, ``self_modification_unsanctioned_source``
+        — with no INTENT ever emitted, so the terminal DECISION arrived
+        here with no state and was dropped as a boot orphan. An op held
+        for a human that the human never sees is the one line this
+        transport must not lose. The ledger's terminal emit stamps
+        ``terminal_state``; that stamp, and not a boot-recovery reason,
+        is what tells a held op from a reconciled ghost."""
+        if not payload.get("terminal_state"):
+            return None
+        if str(payload.get("reason_code", "") or "").startswith("boot_recovery_"):
+            return None
+        files = tuple(payload.get("target_files", []) or [])
+        summary = (
+            _short_path(files[0], max(20, line_chars() // 2)) if files else ""
+        )
+        return _OpState(
+            op_id=op_id, short_id=_short_id(op_id),
+            sensor=self._infer_sensor(payload), summary=str(summary),
+            started_monotonic=0.0, target_files=files,
+        )
 
     # -- the line shape --------------------------------------------------
 

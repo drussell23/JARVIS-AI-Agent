@@ -1059,6 +1059,10 @@ class ClaudeStyleTransport:
         if prior is not None:
             self._cancel_flush(prior)
         self._streams[op_id] = _StreamState(op_id=op_id, provider=provider)
+        logger.info(
+            "[claude_style_transport] stream begin op=%s provider=%s "
+            "(carrying the token tail to cockpits)", op_id, provider,
+        )
 
     def _stream_token(self, op_id: str, content: str) -> None:
         """Append one token and carry the tail to cockpits, coalesced.

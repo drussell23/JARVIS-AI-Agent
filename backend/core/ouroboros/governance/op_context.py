@@ -368,6 +368,16 @@ class ValidationResult:
     failure_class: Optional[str] = None          # "test" | "build" | "infra" | "budget" | None
     short_summary: str = ""                      # ≤300 chars human-readable summary
     adapter_names_run: Tuple[str, ...] = ()      # e.g. ("python",) or ("python", "cpp")
+    # High-resolution test-gate telemetry (Phase 2). The SPECIFIC assertion /
+    # AST error the candidate died on — parsed by ``test_failure_digest`` from
+    # the adapter's own output, not a blind stdout tail. Immutable fields so
+    # ``ValidationResult`` stays hashable. Consumed by the cockpit VALIDATE
+    # heartbeat (operator sees the cause live), the re-planner (the next
+    # GENERATE prompt), and the execution ledger + GRPO recorder.
+    failure_detail: str = ""                     # bounded structured digest
+    failed_tests: Tuple[str, ...] = ()           # failing node ids
+    test_total: int = 0                          # tests run
+    test_failed: int = 0                         # tests failed
 
 
 #: Cap on the summary handed to the re-planner. The field's own comment

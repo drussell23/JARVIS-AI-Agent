@@ -1529,38 +1529,69 @@ def _render_outline(
     return "\n\n".join(parts), fullbody_count, skeletons_count
 
 
+def _chunk_is_focus(chunk: Any, focus_symbols: "Set[str]") -> bool:
+    """Whether ``chunk`` is one of the operator-declared target symbols.
+
+    Matched by bare name, by full qualified name, or by the tail of the
+    qualified name — so a declared ``sub`` matches ``Widget.sub`` and a
+    declared ``Widget.sub`` matches it too. A declared dotted path matches any
+    qualified name that ends with it. NEVER raises."""
+    if not focus_symbols:
+        return False
+    try:
+        name = str(getattr(chunk, "name", "") or "")
+        qual = str(getattr(chunk, "qualified_name", "") or "")
+        qtail = qual.rsplit(".", 1)[-1] if qual else ""
+        if name in focus_symbols or qual in focus_symbols or (
+            qtail and qtail in focus_symbols
+        ):
+            return True
+        return any(qual.endswith(s) for s in focus_symbols if s)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _progressive_skeletonize(
     chunks: Sequence[Any],
     target_chars: int,
+    focus_symbols: Sequence[str] = (),
 ) -> Tuple[str, str, int, int]:
-    """Walk skeletonization tiers until the rendered outline fits the
-    target char budget. Returns ``(outline, tier_used, fullbody_count,
+    """Walk skeletonization tiers until the rendered outline fits the target
+    char budget. Returns ``(outline, tier_used, fullbody_count,
     skeleton_count)``.
 
+    SYMBOL-CENTERED (Phase 3): when ``focus_symbols`` are given — the goal's
+    declared ``target_symbol`` — the tiers skeletonize the NON-focus functions
+    first, biggest-first, and only touch a focus symbol as the very last
+    resort. The model therefore keeps the full body of the symbol it was asked
+    to change even when the file is far over the prefill budget, instead of the
+    size-greedy slicer dropping that symbol precisely because it is large. With
+    no focus symbols this is byte-identical to the size-only Slice 11.4.1 tiers.
+
     Tiers (most-keep → most-aggressive):
-      0. full bodies + all docstrings (Slice 11.3 default)
+      0. full bodies + all docstrings
       1. full bodies + DROP docstrings
-      2. skeletonize 25% of fns by size + DROP docstrings
-      3. skeletonize 50%
-      4. skeletonize 75%
-      5. ALL fn/methods skeletal (module header + class skeletons + signatures)
+      2-4. skeletonize 25% / 50% / 75% of the NON-focus fns by size
+      5. ALL non-focus fns skeletal, focus symbols still full
+      6. everything skeletal incl. focus (last resort — never truncation)
 
-    Picks the SMALLEST tier whose render is ≤ target. If no tier
-    fits, returns the most aggressive tier's render with
-    ``tier_used="tier_5_max_skeletal"`` so the caller still gets a
-    valid outline (better than legacy truncation which would destroy
-    syntactic boundaries).
-
-    NEVER raises."""
+    Picks the SMALLEST tier whose render is ≤ target; if none fits, returns the
+    most aggressive tier so the caller still gets a syntactically-valid outline
+    (better than legacy line-truncation). NEVER raises."""
     from backend.core.ouroboros.governance.ast_slicer import (
         ChunkType,
     )
+    _focus = {str(s).strip() for s in (focus_symbols or ()) if str(s).strip()}
     fn_chunks = [
         c for c in chunks
         if c.chunk_type in (ChunkType.FUNCTION, ChunkType.METHOD)
     ]
-    fn_chunks_by_size = sorted(
-        fn_chunks, key=lambda c: -len(c.source_code),
+    focus_ids = {c.chunk_id for c in fn_chunks if _chunk_is_focus(c, _focus)}
+    # Skeletonize the NON-focus functions first, biggest-first. A focus symbol
+    # is protected until tier 6.
+    rest_by_size = sorted(
+        (c for c in fn_chunks if c.chunk_id not in focus_ids),
+        key=lambda c: -len(c.source_code),
     )
 
     def _try(skeleton_set: Set[str], drop_ds: bool, label: str):
@@ -1581,25 +1612,36 @@ def _progressive_skeletonize(
     if len(out) <= target_chars:
         return out, label, full_n, skel_n
 
-    # Tier 2-4: progressive skeletonization 25% / 50% / 75%
+    # Tier 2-4: progressive skeletonization 25% / 50% / 75% of NON-focus fns.
+    _focus_tag = "_focus" if focus_ids else ""
     for tier_idx, frac in enumerate([0.25, 0.5, 0.75]):
-        n_to_skeleton = max(
-            1, int(len(fn_chunks_by_size) * frac),
-        )
+        n_to_skeleton = max(1, int(len(rest_by_size) * frac)) if rest_by_size else 0
         skeleton_set = {
-            c.chunk_id for c in fn_chunks_by_size[:n_to_skeleton]
+            c.chunk_id for c in rest_by_size[:n_to_skeleton]
         }
         out, label, full_n, skel_n = _try(
             skeleton_set, True,
-            f"tier_{tier_idx+2}_{int(frac*100)}pct_skeletons",
+            f"tier_{tier_idx+2}_{int(frac*100)}pct_skeletons{_focus_tag}",
         )
         if len(out) <= target_chars:
             return out, label, full_n, skel_n
 
-    # Tier 5: ALL fn/methods skeletal — last resort
+    # Tier 5: ALL non-focus fns skeletal, focus symbols STILL full. With no
+    # focus this IS the maximally-skeletal tier, so it keeps the legacy label
+    # (byte-identical); with focus it is a distinct, protected tier.
+    skeleton_set = {c.chunk_id for c in rest_by_size}
+    out, label, full_n, skel_n = _try(
+        skeleton_set, True,
+        "tier_5_nonfocus_skeletal_focus" if focus_ids else "tier_5_max_skeletal",
+    )
+    if len(out) <= target_chars or not focus_ids:
+        return out, label, full_n, skel_n
+
+    # Tier 6: everything skeletal incl. focus — the file cannot fit even with
+    # only the focus symbol full, so give the maximally-skeletal valid outline.
     skeleton_set = {c.chunk_id for c in fn_chunks}
     out, label, full_n, skel_n = _try(
-        skeleton_set, True, "tier_5_max_skeletal",
+        skeleton_set, True, "tier_6_max_skeletal",
     )
     return out, label, full_n, skel_n
 
@@ -1608,6 +1650,7 @@ def _ast_outline_python_file(
     content: str,
     file_path: Path,
     target_chars: Optional[int] = None,
+    focus_symbols: Sequence[str] = (),
 ) -> Optional[Tuple[str, str, int, int]]:
     """Produce an AST-aware outline of a Python file with progressive
     skeletonization to fit ``target_chars``.
@@ -1643,7 +1686,7 @@ def _ast_outline_python_file(
         target_chars = len(content) + 1
 
     out, tier_used, full_n, skel_n = _progressive_skeletonize(
-        chunks, target_chars,
+        chunks, target_chars, focus_symbols=focus_symbols,
     )
     summary_marker = (
         f"\n# [AST-OUTLINE: tier={tier_used} "
@@ -1659,6 +1702,8 @@ def _maybe_ast_outline(
     op_id: str = "",
     provider_route: str = "",
     num_files: int = 1,
+    focus_symbols: Sequence[str] = (),
+    prefill_budget_chars: Optional[int] = None,
 ) -> Optional[str]:
     """Slice 11.4.1 dispatcher — dynamic-budget AST outline.
 
@@ -1678,7 +1723,13 @@ def _maybe_ast_outline(
                                    legacy truncation path)
 
     NEVER raises."""
-    if not _gen_ast_slice_enabled():
+    # Phase 3: a sanctioned goal that declares ``target_symbol`` gets
+    # symbol-centered slicing even when the general AST-slice flag is off — the
+    # operator asked the model to focus on those symbols, so when the file
+    # exceeds the prefill budget we slice AROUND them rather than blind-
+    # truncating. Without focus symbols this stays gated on the master flag
+    # (byte-identical legacy).
+    if not _gen_ast_slice_enabled() and not focus_symbols:
         return None
     if abs_path.suffix.lower() != ".py":
         return None
@@ -1693,12 +1744,19 @@ def _maybe_ast_outline(
     except ImportError:
         return None
 
-    target_chars = _codegen_target_chars_for_route(
-        provider_route, num_files,
+    # Prefer the caller's MEASURED prefill budget (the KV-cache-derived
+    # num_ctx on the local lane) over the route's static max-tokens estimate,
+    # so the slice fits the actual context the engine can hold rather than a
+    # provider default that risks an OOM / ServerDisconnect on a large file.
+    target_chars = (
+        int(prefill_budget_chars)
+        if prefill_budget_chars and prefill_budget_chars > 0
+        else _codegen_target_chars_for_route(provider_route, num_files)
     )
 
     outlined_tuple = _ast_outline_python_file(
         full_content, abs_path, target_chars=target_chars,
+        focus_symbols=focus_symbols,
     )
     if outlined_tuple is None:
         record_slice(SliceMetric(
@@ -3521,11 +3579,27 @@ def _build_codegen_prompt(
             if hasattr(ctx, "op_id") else ""
         )
         _num_files = max(1, len(ctx.target_files))
+        # Phase 3 — the operator-declared target symbols for THIS file, from the
+        # SIGNED goal (the same secure accessor the swarm uses; re-derived from
+        # ground truth, () for any op without a verified roadmap claim). When
+        # present they engage symbol-centered slicing so the model keeps the
+        # full body of the symbol it was asked to change even when the file
+        # exceeds the prefill budget — instead of the size-greedy slicer
+        # dropping that symbol precisely because it is large.
+        _focus_symbols: Tuple[str, ...] = ()
+        try:
+            from backend.core.ouroboros.governance.candidate_generator import (  # noqa: E501,PLC0415
+                _declared_symbols_for,
+            )
+            _focus_symbols = tuple(_declared_symbols_for(ctx, str(raw_path)) or ())
+        except Exception:  # noqa: BLE001 — focus is additive, never fatal
+            _focus_symbols = ()
         ast_outlined = _maybe_ast_outline(
             abs_path, str(raw_path), content,
             op_id=_op_id_short,
             provider_route=provider_route,
             num_files=_num_files,
+            focus_symbols=_focus_symbols,
         )
         if ast_outlined is not None:
             truncated = ast_outlined

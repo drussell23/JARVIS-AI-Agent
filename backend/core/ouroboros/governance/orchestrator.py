@@ -8571,14 +8571,29 @@ class GovernedOrchestrator:
 
                     # Heartbeat: validation result for TUI (Manifesto §7)
                     try:
+                        # Phase 2 root-cause fix: this heartbeat read
+                        # ``test_count`` / ``failure_count`` / ``output_preview``
+                        # — none of which exist on ``ValidationResult`` — so
+                        # every VALIDATE heartbeat reached the cockpit with empty
+                        # detail (only ``failure_class`` survived). Read the REAL
+                        # fields, now carrying the specific assertion the
+                        # candidate died on.
                         _val_msg = type("_Msg", (), {
                             "payload": {
                                 "phase": "validate",
                                 "test_passed": validation.passed,
-                                "test_count": getattr(validation, "test_count", 0),
-                                "test_failures": getattr(validation, "failure_count", 0),
+                                "test_count": getattr(validation, "test_total", 0),
+                                "test_failures": getattr(validation, "test_failed", 0),
                                 "failure_class": validation.failure_class or "",
-                                "validation_output": str(getattr(validation, "output_preview", ""))[:300],
+                                "failure_detail": str(
+                                    getattr(validation, "failure_detail", "") or "",
+                                )[:600],
+                                "failed_tests": list(
+                                    getattr(validation, "failed_tests", ()) or (),
+                                )[:6],
+                                "validation_output": str(
+                                    getattr(validation, "short_summary", "") or "",
+                                )[:300],
                             },
                             "op_id": ctx.op_id,
                             "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
@@ -14420,11 +14435,41 @@ class GovernedOrchestrator:
         assert multi is not None
         duration = time.monotonic() - t0
         adapter_names = tuple(r.adapter for r in multi.adapter_results)
-        summary_parts = []
-        for r in multi.adapter_results:
-            tail = (r.test_result.stdout or "")[-150:] if r.test_result else ""
-            summary_parts.append(f"[{r.adapter}:{'PASS' if r.passed else 'FAIL'}] {tail}")
-        short_summary = " | ".join(summary_parts)[:300]
+
+        # Phase 2 — high-resolution test-gate telemetry. On FAILURE, extract the
+        # SPECIFIC assertion / AST error the candidate died on (the failing node
+        # + the ``E ...`` line + the error class) instead of a blind 150-char
+        # stdout tail — which for pytest is the "1 failed" epilogue, a count not
+        # a cause. The same digest reaches the re-planner (next GENERATE prompt),
+        # the cockpit VALIDATE heartbeat, and the GRPO corpus, so a test-gate
+        # death now says WHY. On PASS the terse per-adapter tag suffices.
+        _digest = None
+        if not multi.passed:
+            try:
+                from backend.core.ouroboros.governance.test_failure_digest import (  # noqa: E501
+                    digest_from_adapter_results,
+                )
+                _digest = digest_from_adapter_results(multi.adapter_results)
+            except Exception:  # noqa: BLE001 — telemetry never fails a verdict
+                _digest = None
+
+        if _digest:
+            short_summary = _digest.headline[:300]
+            _failure_detail = _digest.detail
+            _failed_tests = _digest.failed_tests
+            _test_total = _digest.test_total
+            _test_failed = _digest.test_failed
+        else:
+            summary_parts = []
+            for r in multi.adapter_results:
+                tail = (r.test_result.stdout or "")[-150:] if r.test_result else ""
+                summary_parts.append(
+                    f"[{r.adapter}:{'PASS' if r.passed else 'FAIL'}] {tail}"
+                )
+            short_summary = " | ".join(summary_parts)[:300]
+            _failure_detail = ""
+            _failed_tests = ()
+            _test_total = _test_failed = 0
 
         return ValidationResult(
             passed=multi.passed,
@@ -14434,6 +14479,10 @@ class GovernedOrchestrator:
             failure_class=None if multi.passed else multi.failure_class,
             short_summary=short_summary,
             adapter_names_run=adapter_names,
+            failure_detail=_failure_detail,
+            failed_tests=_failed_tests,
+            test_total=_test_total,
+            test_failed=_test_failed,
         )
 
     def _swe_bench_write_root(self, ctx: OperationContext) -> Optional[Path]:
@@ -15039,6 +15088,17 @@ class GovernedOrchestrator:
                 "candidate_hash": candidate.get("candidate_hash", ""),
                 "validation_outcome": "pass" if validation.passed else "fail",
                 "failure_class": validation.failure_class,
+                # Phase 2 — the SPECIFIC cause the candidate died on, so training
+                # (GRPO) learns WHY a patch failed the gate, not merely that it
+                # did. Bounded at the digest; empty on a pass.
+                "failure_detail": str(
+                    getattr(validation, "failure_detail", "") or "",
+                ),
+                "failed_tests": list(
+                    getattr(validation, "failed_tests", ()) or [],
+                ),
+                "test_total": int(getattr(validation, "test_total", 0) or 0),
+                "test_failed": int(getattr(validation, "test_failed", 0) or 0),
                 "duration_s": round(float(duration_s), 3),
                 "provider": getattr(generation, "provider_name", ""),
                 "model": getattr(generation, "model_id", ""),
@@ -15079,6 +15139,11 @@ class GovernedOrchestrator:
                 candidate_hash=str(candidate.get("candidate_hash", "") or ""),
                 passed=bool(validation.passed),
                 failure_class=str(validation.failure_class or ""),
+                # Phase 2 — the specific assertion/AST cause into the GRPO
+                # corpus alongside the failure_class category.
+                failure_detail=str(
+                    getattr(validation, "failure_detail", "") or "",
+                ),
             )
         except Exception:  # noqa: BLE001 — fail-open
             logger.debug(

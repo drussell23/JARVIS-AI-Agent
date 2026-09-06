@@ -458,6 +458,11 @@ class _PendingGeneration:
     # yields ZERO pairs (measured: 3 uniform siblings -> 0 pairs; the same
     # 3 with per-candidate outcomes -> 2 pairs, method=outcome_diff).
     candidate_verdicts: Dict[str, Tuple[bool, str]] = field(default_factory=dict)
+    # candidate_hash -> the SPECIFIC failure digest (assertion / AST error) a
+    # rejected sibling died on. Parallel to candidate_verdicts (additive — the
+    # verdict tuple's arity is unchanged) so GRPO can rank on the CAUSE, not
+    # only the failure_class category (Phase 2 test-gate telemetry).
+    candidate_details: Dict[str, str] = field(default_factory=dict)
     # Where this generation sits in its op's lineage. A retry exists
     # BECAUSE the previous attempt was rejected, so attempt 0 and attempt 1
     # of one op are very often a genuine {rejected, chosen} pair on the same
@@ -582,6 +587,7 @@ class _CandidateVerdictEvent:
     candidate_hash: str
     passed: bool
     failure_class: str
+    failure_detail: str = ""
 
 
 class TrajectoryRecorder:
@@ -865,6 +871,7 @@ class TrajectoryRecorder:
         candidate_hash: str,
         passed: bool,
         failure_class: str = "",
+        failure_detail: str = "",
     ) -> bool:
         """Queue ONE sibling's VALIDATE verdict. Non-blocking. NEVER raises.
 
@@ -880,6 +887,7 @@ class TrajectoryRecorder:
             candidate_hash=str(candidate_hash),
             passed=bool(passed),
             failure_class=str(failure_class or ""),
+            failure_detail=str(failure_detail or ""),
         )
         if self._offer(evt):
             self._stats["candidate_verdicts_queued"] += 1
@@ -1121,6 +1129,9 @@ class TrajectoryRecorder:
             target.candidate_verdicts[evt.candidate_hash] = (
                 evt.passed, evt.failure_class,
             )
+            _detail = getattr(evt, "failure_detail", "") or ""
+            if _detail:
+                target.candidate_details[evt.candidate_hash] = _detail
             self._stats["candidate_verdicts_joined"] += 1
 
     def _guard(self) -> Any:
@@ -1436,6 +1447,9 @@ class TrajectoryRecorder:
                 1.0 if c_outcome == "success"
                 else (0.0 if c_outcome == "failure" else 0.5)
             )
+            # Phase 2 — the specific assertion/AST cause this sibling died on,
+            # so the ranker can learn from the CAUSE, not only the category.
+            c_detail = gen.candidate_details.get(cand_hash, "")
             line = json.dumps(
                 {
                     "event_id": str(uuid.uuid4()),
@@ -1480,6 +1494,9 @@ class TrajectoryRecorder:
                         "candidate_hash": cand_hash,
                         "candidate_index": idx,
                         "n_candidates": n_cands,
+                        # The specific test-gate cause (Phase 2), empty on a
+                        # pass or an unassessed/infra failure.
+                        "failure_detail": c_detail,
                         # `n_candidates` counts ROWS; this counts ANSWERS.
                         # A consumer selecting trainable groups must filter
                         # on THIS -- three rows sharing one structure_id

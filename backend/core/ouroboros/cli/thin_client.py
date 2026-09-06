@@ -567,6 +567,80 @@ def _live_incumbent() -> Optional[int]:
         return None
 
 
+def _visible_len(text: str) -> int:
+    """How many COLUMNS the terminal will give *text*.
+
+    ``len()`` counts code points, which is the wrong unit for a line that
+    carries box-drawing and block glyphs: a string of 85 code points can
+    occupy more or fewer than 85 columns, and a redraw that guesses wrong
+    either wraps (tearing) or under-erases (debris).
+
+    ``wcwidth`` is the correct answer and is optional here; without it the
+    code-point count is a serviceable approximation for this line, whose
+    glyphs are overwhelmingly single-width. Never raises.
+    """
+    try:
+        from wcwidth import wcswidth  # noqa: PLC0415 — optional dependency
+
+        measured = wcswidth(text)
+        if isinstance(measured, int) and measured >= 0:
+            return measured
+    except Exception:  # noqa: BLE001 — absent or confused: fall back
+        pass
+    return len(text)
+
+
+def _terminal_columns(stream: Any) -> int:
+    """The terminal's current width, or 0 when it cannot be known.
+
+    Asked fresh on every redraw rather than cached, so a window resized
+    mid-boot re-fits on the next frame instead of tearing until restart.
+    Returns 0 rather than a guess: a wrong width is worse than no clamp,
+    because it truncates content that would have fitted.
+    """
+    try:
+        import os as _os  # noqa: PLC0415
+
+        fd = getattr(stream, "fileno", None)
+        if callable(fd):
+            return int(_os.get_terminal_size(fd()).columns)
+    except Exception:  # noqa: BLE001 — not a tty, or no ioctl
+        pass
+    try:
+        import shutil as _shutil  # noqa: PLC0415
+
+        # COLUMNS honours an operator override; fallback=(0, 0) keeps the
+        # "unknown" answer distinguishable from a real 80.
+        return int(_shutil.get_terminal_size(fallback=(0, 0)).columns)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _fit_to_width(text: str, columns: int) -> str:
+    """Trim *text* so it cannot wrap, keeping the LEFT.
+
+    The left is where the meaning is: the bar, the percentage and the stage
+    label answer "is it moving"; the trailing detail is elaboration. An
+    ellipsis marks the cut so a truncated line never reads as a complete
+    one -- and it is only added when there is room for it to mean anything.
+    """
+    if columns <= 0 or _visible_len(text) <= columns:
+        return text
+    if columns <= 1:
+        return text[:columns]
+    ell = "…"
+    budget = columns - _visible_len(ell)
+    out = []
+    used = 0
+    for ch in text:
+        w = _visible_len(ch)
+        if used + w > budget:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + ell
+
+
 def _mk_tick(say: Callable[[str], None],
              on_progress: Optional[Callable[[str], None]] = None,
              ) -> Callable[[float], None]:
@@ -629,7 +703,6 @@ def _mk_tick(say: Callable[[str], None],
     # takes the fast cadence too — it is repainting anyway.
     live_owner = on_progress is not None
     cadence = 0.25 if ((interactive or live_owner) and enabled) else 5.0
-    width = [0]
 
     def _tick(elapsed: float) -> None:
         if elapsed - last[0] < cadence:
@@ -662,11 +735,28 @@ def _mk_tick(say: Callable[[str], None],
             # line — which turns a carriage-return redraw back into the very
             # append this replaces.
             out = sys.__stdout__ or sys.stdout
-            # Pad to the previous width so a shrinking line cannot leave the
-            # tail of the longer one behind it.
-            pad = max(0, width[0] - len(line))
-            width[0] = len(line)
-            out.write("\r" + line + (" " * pad))
+            # A CARRIAGE RETURN CANNOT UNDO A WRAP.
+            #
+            # This line runs 85 columns at full extent ("[bar] 75%  session
+            # open  108s  +98s over  waiting on cockpit wired"). On any
+            # terminal narrower than that it WRAPS, and `\r` then returns to
+            # the start of the last visual row only — so each redraw paints
+            # over half of itself and leaves the other half standing. Four
+            # times a second that reads as flicker, which is exactly what it
+            # was: not an animation, a line fighting its own wrap.
+            #
+            # Clamped to the CURRENT width on every tick rather than once at
+            # construction, so resizing the terminal mid-boot re-fits instead
+            # of tearing until restart. `_visible_len` measures what the
+            # terminal will actually allot, not how many code points there
+            # are — the bar glyphs and the ⎿ are not all one column wide.
+            cols = _terminal_columns(out)
+            body = _fit_to_width(line, cols) if cols else line
+            # `\033[K` erases from the cursor to end of line: the terminal's
+            # own primitive for exactly this, and it replaces the manual
+            # space-padding plus the `width[0]` it had to carry. One escape,
+            # no state, and correct when the previous frame wrapped.
+            out.write("\r" + body + "\033[K")
             out.flush()
         except Exception:  # noqa: BLE001
             say(line)

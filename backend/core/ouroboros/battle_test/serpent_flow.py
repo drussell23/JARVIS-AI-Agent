@@ -1192,6 +1192,12 @@ class SerpentFlow:
                         self._mirror_markup(msg)
                 except Exception:  # noqa: BLE001
                     pass
+                # Already mirrored above when it was a string; a relaying
+                # console must not carry it a second time. A renderable
+                # was NOT mirrored (a line stream cannot carry it), so the
+                # relay stays the only path for those.
+                if isinstance(msg, str) and getattr(self.console, "relays_prints", False):
+                    kw["mirror"] = False
                 self.console.print(msg, **kw)
 
             self._unsub_inline_prompt_renderer: Callable[[], None] = (
@@ -1604,15 +1610,24 @@ class SerpentFlow:
         except Exception:  # noqa: BLE001
             return markup
 
-    def _emit_fit(self, markup: str) -> None:
-        """Print one borderless line: grayscale-normalized + overflow-safe."""
+    def _emit_fit(self, markup: str, *, mirror: bool = True) -> None:
+        """Print one borderless line: grayscale-normalized + overflow-safe.
+
+        ``mirror=False`` says the caller has ALREADY sent this line to the
+        cockpit through ``_mirror_markup``; a relaying console is then asked
+        not to carry it a second time. Keyed on the console's own
+        ``relays_prints`` marker so a plain Rich console — which has no such
+        kwarg — is printed to exactly as before."""
+        kw: Dict[str, Any] = {}
+        if not mirror and getattr(self.console, "relays_prints", False):
+            kw["mirror"] = False
         try:
             from backend.core.ouroboros.battle_test.presentation_restraint import (
                 print_fit,
             )
-            print_fit(self.console, self._clean_markup(markup))
+            print_fit(self.console, self._clean_markup(markup), **kw)
         except Exception:  # noqa: BLE001
-            self.console.print(markup, highlight=False)
+            self.console.print(markup, highlight=False, **kw)
 
     def _synth_pulse(self, op_id: str, provider: str):
         """Async context that masks an awaited generation with the EXISTING
@@ -1682,7 +1697,8 @@ class SerpentFlow:
         )
         if self._borderless():
             self._emit_fit(
-                f"{self._action_glyph()} {sensor}  [{_SEM['dim']}]{short}[/{_SEM['dim']}]"
+                f"{self._action_glyph()} {sensor}  [{_SEM['dim']}]{short}[/{_SEM['dim']}]",
+                mirror=False,        # mirrored just above; do not relay twice
             )
             return
         w = self._block_w()
@@ -1796,8 +1812,7 @@ class SerpentFlow:
         except Exception:  # noqa: BLE001
             pass
         # Attach mirror: the grep-friendly op receipt (outcome + cost).
-        self._mirror_markup(receipt)
-        self.console.print(receipt, highlight=False)
+        self._print_mirrored(receipt)
 
     def _close_op_block(self, op_id: str) -> None:
         """Print the bottom border of an op block with running stats.
@@ -1848,9 +1863,15 @@ class SerpentFlow:
         label = f" {short} ── {stats} "
         vis = _visible_len(label)
         pad = max(2, w - vis - 2)
+        # The stats already went to the cockpit above, width-agnostic. The
+        # bordered rule is the LOCAL rendering of the same fact and must not
+        # be relayed as a second, wider copy of it.
+        _kw: Dict[str, Any] = (
+            {"mirror": False} if getattr(self.console, "relays_prints", False) else {}
+        )
         self.console.print(
             f"  [{_SEM['border']}]└{label}{'─' * pad}[/{_SEM['border']}]",
-            highlight=False,
+            highlight=False, **_kw,
         )
         self.console.print()
 
@@ -1969,7 +1990,8 @@ class SerpentFlow:
             self._mirror_markup(f"  {text}")
             if self._borderless():
                 self._emit_fit(
-                    f"  [{_SEM['dim']}]{self._result_glyph()}[/{_SEM['dim']}] {text}"
+                    f"  [{_SEM['dim']}]{self._result_glyph()}[/{_SEM['dim']}] {text}",
+                    mirror=False,    # mirrored just above; do not relay twice
                 )
             else:
                 self.console.print(
@@ -1978,8 +2000,7 @@ class SerpentFlow:
                 )
         else:
             # Out-of-band lines (system messages, banners) — always render
-            self._mirror_markup(f"  {text}")
-            self.console.print(f"  {text}", highlight=False)
+            self._print_mirrored(f"  {text}")
 
     def _mirror_markup(self, line: str) -> None:
         """Mirror ONE rendered markup line to the attach cockpit (when the
@@ -1993,6 +2014,31 @@ class SerpentFlow:
         try:
             m(line)
         except Exception:  # noqa: BLE001
+            pass
+
+    def _print_mirrored(self, mirror_line: str, print_line: Optional[str] = None,
+                        **kw: Any) -> None:
+        """Send ONE line to the cockpit and to the local console, ONCE each.
+
+        The harness swaps ``self.console`` for a spooled console that relays
+        everything printed to it (ambient included — that is its contract).
+        Every site that ALSO called ``_mirror_markup`` therefore published the
+        same line twice: styled from the mirror, plain from the relay. Each
+        ``⏺ X queued`` arrived at the cockpit as a pair (measured 2026-09-06).
+
+        This is the one seam that knows both facts. The styled line goes to
+        the mirror; the local print asks a relaying console not to relay it
+        again. A plain console has no such request and is printed to as
+        before — keyed on the console's own ``relays_prints`` marker, never on
+        its class. NEVER raises."""
+        self._mirror_markup(mirror_line)
+        text = mirror_line if print_line is None else print_line
+        kw.setdefault("highlight", False)
+        try:
+            if getattr(self.console, "relays_prints", False):
+                kw["mirror"] = False
+            self.console.print(text, **kw)
+        except Exception:  # noqa: BLE001 — a render fault never breaks a producer
             pass
 
     # ── Gap #3 Slice 3: op-block buffer integration helpers ──────
@@ -2117,11 +2163,7 @@ class SerpentFlow:
                     f"[/{_SEM['dim']}]" if lines
                     else f"  [{_SEM['dim']}]{ref} · /expand {ref}[/{_SEM['dim']}]")
         line = f"[{_SEM['neural']}]{label}[/{_SEM['neural']}]{tail}"
-        self._mirror_markup(f"  {line}")
-        try:
-            self.console.print(f"  {line}", highlight=False)
-        except Exception:
-            pass
+        self._print_mirrored(f"  {line}")
 
     @staticmethod
     def _collapsed_label(summary: str, block: Any) -> str:
@@ -2519,8 +2561,7 @@ class SerpentFlow:
                 f"Generated {token_count} tokens{via_seg}"
             )
             # Attach mirror: the synthesis receipt (tokens + provider).
-            self._mirror_markup(gen_receipt)
-            self.console.print(gen_receipt, highlight=False)
+            self._print_mirrored(gen_receipt)
         # Reset state for the next synthesis cycle.
         self._stream_buffer = ""
         self._stream_token_count = 0
@@ -4193,7 +4234,7 @@ class SerpentFlow:
 
             self._mirror_markup(line)
             if self._borderless():
-                self._emit_fit(line)
+                self._emit_fit(line, mirror=False)   # mirrored just above
         except Exception:  # noqa: BLE001 — a deck line must never break intake
             pass
 
@@ -5938,9 +5979,16 @@ class SerpentREPL:
                         self._flow._mirror_markup(styled)
                     except Exception:  # noqa: BLE001
                         pass
+                    # Mirrored just above; a relaying console must not
+                    # carry the same styled line a second time.
+                    _kw: Dict[str, Any] = (
+                        {"mirror": False}
+                        if getattr(self._flow.console, "relays_prints", False)
+                        else {}
+                    )
                     self._flow.console.print(
                         styled,
-                        highlight=False,
+                        highlight=False, **_kw,
                     )
                 except Exception:  # noqa: BLE001 — one bad event never kills the loop
                     continue
@@ -6211,10 +6259,7 @@ class SerpentREPL:
                 # Addressing is handled at the bridge from the ContextVar the
                 # dispatch is running inside, so a verb typed in cockpit A
                 # returns to cockpit A alone.
-                self._flow._mirror_markup(_outcome.text)
-                self._flow.console.print(
-                    _outcome.text, highlight=False,
-                )
+                self._flow._print_mirrored(_outcome.text)
             self._flow.console.print()
             return True
         if line in (
@@ -8973,8 +9018,7 @@ class SerpentREPL:
             )
             return
         text = render_ref(ref)
-        self._flow._mirror_markup(text)
-        self._flow.console.print(text, highlight=False)
+        self._flow._print_mirrored(text)
 
     def _expand_repair_branch(self, ref: str) -> None:
         """Treefinement Phase 4 — re-render an archived L2 tree-search

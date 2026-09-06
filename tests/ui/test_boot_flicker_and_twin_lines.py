@@ -79,16 +79,36 @@ def test_the_sequences_are_dec_mode_2026() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cache(tmp_path, monkeypatch):
+    """Never read or pollute the user's real ~/.jarvis/crest_anim."""
+    monkeypatch.setenv("JARVIS_CREST_ANIM_CACHE_DIR", str(tmp_path / "crest_cache"))
+    yield
+
+
 def _plain_rows(renderable) -> list:
+    """Rendered rows, INCLUDING blank ones. `rstrip("\\n")` would delete the
+    very padding rows this file exists to count; only the terminator that
+    `Console.print` appends is dropped."""
     from rich.console import Console
     c = Console(file=io.StringIO(), width=120, force_terminal=False,
                 color_system=None)
     c.print(renderable)
-    return c.file.getvalue().rstrip("\n").split("\n")
+    return c.file.getvalue().split("\n")[:-1]
 
 
-def _anim():
-    return ca.CrestAnimator(cols=40, rows=10, log_lines=4, frame_count=2)
+def _anim(**kw):
+    """Same construction the animator's own suite uses, so a size the
+    raster refuses skips rather than reading as a silent no-paint."""
+    kw.setdefault("cols", 60)
+    kw.setdefault("rows", 24)
+    kw.setdefault("frame_count", 6)
+    kw.setdefault("ss", 1)
+    kw.setdefault("log_lines", 4)
+    a = ca.CrestAnimator(**kw)
+    if not a.available:
+        pytest.skip("crest raster unavailable at this size")
+    return a
 
 
 def test_the_log_window_has_the_same_height_empty_and_full() -> None:

@@ -89,6 +89,51 @@ def _fps() -> int:
     return _env_int("JARVIS_CREST_ANIM_FPS", 14, 4, 30)
 
 
+def _synchronized_paint(console: Any):
+    """A context-manager factory that brackets ONE paint in synchronized
+    output, or does nothing when the other end is not a real terminal.
+
+    Decided ONCE per playback, not per frame: the answer is a property of
+    the terminal, and asking fourteen times a second would be waste. The
+    bytes go to the console's own stream, the same one `Live` writes to,
+    so BEGIN, the frame and END arrive in order on a single file. Flushed
+    after END so the terminal is released to paint immediately rather than
+    whenever the buffer next fills. NEVER raises; a stream that refuses the
+    write simply gets an unbracketed frame, which is what it got before.
+    """
+    from contextlib import contextmanager
+    try:
+        from backend.core.ouroboros.ui.theme import (
+            SYNC_BEGIN, SYNC_END, supports_synchronized_output,
+        )
+        is_tty = bool(getattr(console, "is_terminal", False))
+        enabled = supports_synchronized_output(is_tty=is_tty)
+        stream = getattr(console, "file", None)
+    except Exception:  # noqa: BLE001
+        enabled, stream = False, None
+
+    @contextmanager
+    def _noop():
+        yield
+
+    @contextmanager
+    def _bracketed():
+        try:
+            stream.write(SYNC_BEGIN)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            yield
+        finally:
+            try:
+                stream.write(SYNC_END)
+                stream.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return _bracketed if (enabled and stream is not None) else _noop
+
+
 def _frame_count_env() -> int:
     """Frames per full lap — the ring resolution of the rotation."""
     return _env_int("JARVIS_CREST_ANIM_FRAMES", 24, 4, 96)
@@ -560,15 +605,32 @@ class CrestAnimator:
                 lines = list(self._logs)
             with self._lock:
                 progress = self._progress
-            t = Text()
-            for i, ln in enumerate(lines):
-                t.append(ln, style=_LOG_RGB)
-                if i < len(lines) - 1 or progress:
-                    t.append("\n")
+            # FIXED HEIGHT, from the first frame. The window is the deque's
+            # own capacity plus the one gauge slot, padded to that height
+            # whether or not anything has arrived yet.
+            #
+            # Why: `Live` (screen=False) repaints by moving the cursor up
+            # the height of the LAST frame and rewriting. While the log
+            # filled — one row per boot event — and again each time the
+            # gauge appeared or cleared, the region's height changed under
+            # it, so the terminal scrolled and re-laid out the whole block.
+            # Every one of those was a visible jump. A region that never
+            # changes height is repainted in place and never scrolls; the
+            # deque's maxlen already fixes the ceiling, this makes the floor
+            # match it.
+            slots = int(self._logs.maxlen or max(1, len(lines)))
+            rows = list(lines[-slots:])
+            rows += [""] * (slots - len(rows))
             # LAST, and always last: the gauge sits beneath the transcript so
-            # new log entries push it down rather than scrolling past it.
-            if progress:
-                t.append(progress, style=_LOG_RGB)
+            # new log entries push it down rather than scrolling past it —
+            # and it is always PRESENT, blank when spent, so its arrival and
+            # departure cannot move the rows above it.
+            rows.append(progress)
+            t = Text()
+            for i, ln in enumerate(rows):
+                t.append(ln, style=_LOG_RGB)
+                if i < len(rows) - 1:
+                    t.append("\n")
             return t
         except Exception:  # noqa: BLE001
             return ""
@@ -625,24 +687,48 @@ class CrestAnimator:
             return
         phase = 0.0
         ticks = 0
+        # ONE PAINT PER FRAME, ATOMIC. `Live` repaints a region by moving the
+        # cursor up and rewriting every line; nothing groups the erase and
+        # the rewrite, so at fourteen frames a second the terminal can show
+        # the region half-drawn. That is the boot-time flicker. DEC mode
+        # 2026 makes the terminal hold everything between BEGIN and END and
+        # paint once; every paint below — the first, each frame, the resting
+        # emblem — is bracketed by it. Emitted only when a real VT terminal
+        # is on the other end (`supports_synchronized_output`), which is
+        # also why the Live is started by hand rather than by `with`: the
+        # context manager's own first paint would land outside the bracket.
+        sync = _synchronized_paint(console)
+        live = Live(
+            self.render(phase), console=console, refresh_per_second=rate,
+            transient=False, auto_refresh=False, screen=False,
+        )
         try:
-            with Live(
-                self.render(phase), console=console, refresh_per_second=rate,
-                transient=False, auto_refresh=False, screen=False,
-            ) as live:
+            with sync():
+                live.start(refresh=True)
+            try:
                 while True:
                     await sleep(1.0 / rate)          # cooperative yield
                     phase = (phase + step) % 1.0
-                    live.update(self.render(phase))
-                    live.refresh()
+                    with sync():
+                        live.update(self.render(phase))
+                        live.refresh()
                     ticks += 1
                     if max_frames is not None and ticks >= max_frames:
                         break
                     done = (stop_event is None or stop_event.is_set()) and ticks >= min_ticks
                     if done and phase < step:        # lap boundary → snap-free
                         break
-                live.update(self.render_resting())   # settle on the TRUE emblem
-                live.refresh()
+                with sync():
+                    live.update(self.render_resting())   # settle on the TRUE emblem
+                    live.refresh()
+            finally:
+                # `stop()` paints once more as it releases the region and
+                # restores the cursor. It is a paint like any other and gets
+                # the same bracket — measured: without it, the very last
+                # frame of every boot was the one frame the terminal could
+                # show half-drawn.
+                with sync():
+                    live.stop()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

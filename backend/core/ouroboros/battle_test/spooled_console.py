@@ -247,13 +247,29 @@ def make_spooled_console(
                 from rich.console import ConsoleDimensions
                 return ConsoleDimensions(width, 24)
 
+        #: The seam a producer checks before passing ``mirror=False``. A
+        #: plain Rich console has no such kwarg and would raise on it; the
+        #: attribute, not the class name, is what a producer keys on, so a
+        #: future relaying console needs only to declare it.
+        relays_prints = True
+
         def print(self, *args: Any, **kwargs: Any) -> None:  # noqa: A003
             # LOCAL RENDER FIRST, and unconditionally. A daemon running in the
             # foreground must look exactly as it did; mirroring is additive.
+            # `mirror=False`: print locally, do NOT relay. For a producer that
+            # has ALREADY sent this line to the cockpit in its styled form
+            # through `markup_mirror`. Without it every such line reached the
+            # cockpit twice — once styled from the mirror, once plain from
+            # this relay (measured 2026-09-06: each `⏺ X queued` arrived as a
+            # pair). The relay stays the carrier for everything else,
+            # addressed and ambient alike; the contract below is unchanged.
+            mirror = bool(kwargs.pop("mirror", True))
             try:
                 super().print(*args, **kwargs)
             except Exception:  # noqa: BLE001
                 pass
+            if not mirror:
+                return
             try:
                 # Rendered for the cockpit this line is ADDRESSED to —
                 # `current_session()` is read below for routing, and the

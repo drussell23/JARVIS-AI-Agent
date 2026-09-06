@@ -23,6 +23,7 @@ from __future__ import annotations
 import enum
 import logging
 import os
+import sys
 from typing import Callable, Mapping, Optional
 
 from rich.console import Console
@@ -163,6 +164,68 @@ def supports_unicode(env: Optional[Mapping[str, str]] = None) -> bool:
         if "utf" in val.lower():
             return True
     return False
+
+
+#: DEC private mode 2026 — synchronized output. Between BEGIN and END the
+#: terminal buffers everything it receives and paints once, so a region
+#: erased and redrawn in one burst is never seen half-drawn.
+SYNC_BEGIN = "\x1b[?2026h"
+SYNC_END = "\x1b[?2026l"
+
+
+def supports_synchronized_output(
+    env: Optional[Mapping[str, str]] = None, *, is_tty: Optional[bool] = None,
+) -> bool:
+    """Should a live region bracket each repaint in synchronized output?
+
+    ## Why this exists
+
+    `rich.live.Live` repaints a region by moving the cursor up and rewriting
+    every line. Nothing groups the erase and the rewrite into one paint, so a
+    terminal can show the erased region before the new frame lands. At the
+    crest animation's fourteen frames a second, on a block twenty-odd rows
+    tall, that gap is the flicker the operator sees at every boot. DEC mode
+    2026 is the terminal feature built for exactly this, and Rich does not
+    emit it.
+
+    ## Why this is not a capability table
+
+    A private-mode sequence a terminal does not implement is ignored — that
+    is what makes the modes private. So the honest answer is "emit whenever
+    a real terminal is on the other end", not "emit for terminals on a list
+    someone remembers to update". The only terminals worth excluding are
+    the ones that are not VT terminals at all, which `TERM` already names.
+
+    Resolution order, same shape as :func:`supports_unicode`:
+
+    1. **An explicit override wins.** ``JARVIS_SYNC_OUTPUT`` set to a
+       falsy value disables it; a truthy value forces it. Absent means
+       decide.
+    2. **No terminal, no brackets.** Written into a pipe or a log they are
+       bytes of noise. ``is_tty`` is injectable so the decision is a pure
+       function under test.
+    3. ``TERM`` of ``dumb`` (or unset) is not a VT terminal.
+
+    Pure when given ``env`` and ``is_tty``. NEVER raises.
+    """
+    try:
+        e = os.environ if env is None else env
+        raw = str(e.get("JARVIS_SYNC_OUTPUT", "") or "").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return False
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if is_tty is None:
+            try:
+                is_tty = bool(sys.stdout.isatty())
+            except Exception:  # noqa: BLE001
+                is_tty = False
+        if not is_tty:
+            return False
+        term = str(e.get("TERM", "") or "").strip().lower()
+        return bool(term) and term != "dumb"
+    except Exception:  # noqa: BLE001 — a probe never raises
+        return False
 
 
 # ===========================================================================

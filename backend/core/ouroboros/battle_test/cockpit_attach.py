@@ -867,7 +867,21 @@ class CockpitAttachBridge:
                 # would replay frames the operator disabled, so a kill switch
                 # would become a delay.
                 return
-            msg = {"type": "markup", "text": str(text), "ts": time.time()}
+            # A LINE STREAM CARRIES LINES. A Rich renderable handed here by a
+            # producer that forgot to render it would cross the wire as its
+            # repr — `<rich.panel.Panel object at 0x...>` reached a cockpit
+            # this way (measured 2026-09-06, the boot masthead). That is
+            # worse than dropping it: it is a line that looks like a bug and
+            # says nothing. Refused here, at the one seam every markup frame
+            # passes through, and said so at DEBUG with the producer's type,
+            # so the next reader can find the caller rather than the symptom.
+            if not isinstance(text, str):
+                logger.debug(
+                    "[CockpitAttach] markup publish refused a non-string "
+                    "%s — render it before publishing", type(text).__name__,
+                )
+                return
+            msg = {"type": "markup", "text": text, "ts": time.time()}
             if session:
                 msg["session"] = session
             if not self._clients:

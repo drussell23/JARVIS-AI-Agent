@@ -60,7 +60,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
 from typing import (
-    Any, Dict, List, Mapping, NoReturn, Optional, Protocol, Tuple,
+    Any, Dict, List, Mapping, NoReturn, Optional, Protocol, Sequence, Tuple,
     runtime_checkable,
 )
 
@@ -2838,21 +2838,124 @@ def _select_served_entry(
             return None
         want = (pin if pin is not None else _model_pin()).strip()
         if want:
-            for entry in models:
-                if _entry_name(entry) == want:
-                    return entry
-            base = want.split(":")[0]
-            for entry in models:
-                if _entry_name(entry).split(":")[0] == base:
-                    return entry
+            matched = _match_pin(models, want)
+            if matched is not None:
+                return matched
             logger.warning(
                 "[CandidateGenerator] pinned local model %r is not served "
-                "(node offers %s) -- falling back to largest-by-size",
+                "(node offers %s) -- falling back to largest-by-size. The "
+                "BOOT GATE (`resolve_active_model`) refuses this outright; "
+                "reaching here means a pin changed under a running process.",
                 want, ", ".join(sorted(_entry_name(m) for m in models)) or "none",
             )
         return max(models, key=lambda m: (m or {}).get("size", 0) or 0)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _match_pin(
+    models: Sequence[Dict[str, Any]], want: str,
+) -> Optional[Dict[str, Any]]:
+    """The entry a pin names, or None. THE matching rule, defined once.
+
+    Exact tag first, then base tag (``qwen3.8`` matches ``qwen3.8:27b``).
+    Extracted so the SELECTOR and the boot-time VALIDATOR cannot disagree
+    about whether a pin is honoured -- a validator that admitted a pin the
+    selector would then ignore is worse than no validator, because it
+    certifies the substitution it was built to prevent. Pure; NEVER raises.
+    """
+    try:
+        target = str(want or "").strip()
+        if not target:
+            return None
+        for entry in models:
+            if _entry_name(entry) == target:
+                return entry
+        base = target.split(":")[0]
+        for entry in models:
+            if _entry_name(entry).split(":")[0] == base:
+                return entry
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class ModelPinUnavailable(RuntimeError):
+    """The operator pinned a model this node does not serve.
+
+    Carries both halves of the evidence so the caller can render an alert
+    that is actionable without a second lookup: what was asked for, and
+    what the node actually offers.
+    """
+
+    def __init__(self, pin: str, served: Sequence[str]) -> None:
+        self.pin = str(pin)
+        self.served = tuple(str(s) for s in served)
+        super().__init__(
+            f"pinned model {self.pin!r} is not served by this node "
+            f"(offers: {', '.join(self.served) or 'nothing'})"
+        )
+
+
+#: The tag this process WILL dispatch to, resolved once against a registry
+#: that answered. Empty until the boot gate runs — an empty string means
+#: "not yet resolved", never "no model", so a surface can tell the two
+#: apart instead of rendering a confident blank.
+_ACTIVE_MODEL_TAG = ""
+
+
+def resolve_active_model(
+    tags: Optional[Dict[str, Any]], *, pin: Optional[str] = None,
+) -> str:
+    """The tag that will actually be dispatched to. FAIL-CLOSED on a pin.
+
+    The selector above is fail-soft by contract, because a grader on the
+    hot path must never stop a running loop. That is the right policy
+    there and the wrong one at boot: a pin the node does not serve means
+    every subsequent generation silently answers from a DIFFERENT model,
+    and a model A/B then compares a model against itself. Measured on this
+    host: with no pin, "largest by size" selects ``qwen2.5-coder:32b``
+    (19.85 GB) over the fine-tuned ``qwen3-coder-ov:30b`` (18.58 GB) --
+    the substitution is not even in the same family.
+
+    So this raises rather than substituting. The caller decides what to do
+    with that; the daemon's boot gate declines to start.
+
+    Note what is NOT a fault here: an EMPTY or unreadable registry. That is
+    "we could not ask", not "the model is absent", and the two must not
+    share a verdict — the lane preflight already dies loudly when the
+    engine cannot serve, and a second opinion here would turn a transient
+    blip into a self-kill. Only a registry that ANSWERED and does not
+    contain the pin is evidence.
+    """
+    models = [m for m in ((tags or {}).get("models") or []) if m]
+    if not models:
+        # Nothing to prove either way. Report the pin as the intent it is.
+        return (pin if pin is not None else _model_pin()).strip()
+    want = (pin if pin is not None else _model_pin()).strip()
+    if want and _match_pin(models, want) is None:
+        raise ModelPinUnavailable(
+            want, sorted(_entry_name(m) for m in models),
+        )
+    return _entry_name(_select_served_entry(tags, pin=want)) or ""
+
+
+def set_active_model_tag(tag: str) -> None:
+    """Record the resolved tag for every surface that reports it."""
+    global _ACTIVE_MODEL_TAG  # noqa: PLW0603
+    _ACTIVE_MODEL_TAG = str(tag or "").strip()
+
+
+def active_model_tag() -> str:
+    """The tag this process resolved at boot, or "" if it has not yet.
+
+    THE one answer to "which model is answering". The cockpit banner used
+    to derive this from the CLIENT's own environment, which is a different
+    process with a different environment — so a correctly pinned daemon
+    rendered no model at all, and a stale client export would have
+    rendered the wrong one confidently.
+    """
+    return _ACTIVE_MODEL_TAG
 
 
 def _parse_served_model(tags: Optional[Dict[str, Any]]) -> Optional[str]:

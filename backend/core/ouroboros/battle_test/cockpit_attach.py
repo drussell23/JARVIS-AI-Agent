@@ -761,7 +761,33 @@ class CockpitAttachBridge:
             "liquidity": _safe(self._liquidity, {}),
             "fabrics": _safe(self._fabrics, {}),
             "audio": {"state": self._audio_state},
+            # WHICH MODEL IS ANSWERING — from the process that will answer.
+            #
+            # The cockpit banner used to derive this from the CLIENT's own
+            # environment. The client is a different process with a
+            # different environment: it never loads `.env`, so a correctly
+            # pinned daemon rendered NO model at all, and a stale client
+            # export would have rendered the wrong one confidently. The
+            # operator had no way to tell a fine-tune from its base.
+            #
+            # Resolved at the daemon's boot gate against a registry that
+            # answered, so this is what is loaded, not what was requested.
+            # Empty means "not yet resolved" and the banner omits the
+            # field — naming a model we are not certain of is worse than
+            # naming none.
+            "model": _safe(self._active_model, ""),
         }
+
+    @staticmethod
+    def _active_model() -> str:
+        """The tag the generation lane resolved. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.candidate_generator import (
+                active_model_tag,
+            )
+            return active_model_tag()
+        except Exception:  # noqa: BLE001 — a banner never breaks an attach
+            return ""
 
     # ---- publish (the harness _repl_print mirror) ----
 

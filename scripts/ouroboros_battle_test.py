@@ -168,6 +168,39 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+# ── THE DAEMON'S CONFIGURATION FLOOR ──────────────────────────────────────
+#
+# `env_bootstrap`'s own docstring says "every process boundary
+# (unified_supervisor, backend.main, THE OV THIN-CLIENT DAEMON) calls
+# load_env_once at its highest bootstrap point". This one did not, and the
+# promise went unkept for as long as nobody read the two files together.
+#
+# What that cost, measured 2026-09-06: `spawn_daemon` copies the launching
+# process's environment into the child, a login shell has no
+# JARVIS_LOCAL_MODEL_NAME, and nothing downstream ever read `.env`. So a
+# cold `ov` from a fresh terminal booted an organism with NO model pin,
+# selection fell through to "largest by size", and the host answered from
+# `qwen2.5-coder:32b` (19.85 GB) instead of the fine-tuned
+# `qwen3-coder-ov:30b` (18.58 GB) -- a different model family, chosen
+# silently, with the operator's own pin sitting unread in `.env`.
+#
+# It belongs HERE rather than in the harness: this is the first line after
+# the repo becomes importable and before ANY `backend.*` module is loaded,
+# so no module can capture a config value before the file that supplies it
+# has been read. Later is not equivalent -- module-scope `os.environ.get`
+# calls are evaluated at import time.
+#
+# Precedence is the loaded module's, not a second policy invented here:
+# `override=False` means a real exported variable always wins and `.env`
+# supplies DEFAULTS. That IS the resolution cascade -- explicit
+# environment, then `.env`, then each reader's own documented default.
+# Idempotent and never-raising by contract, so a missing python-dotenv or
+# a malformed file degrades to "use the environment as-is" rather than
+# blocking a boot.
+from backend.core.env_bootstrap import load_env_once as _load_env_once  # noqa: E402
+
+_load_env_once()
+
 # ov awakening Task 1 — presentation-mode gate (COCKPIT vs SOAK). Leaf
 # module: stdlib only, safe to import at top level now that _PROJECT_ROOT
 # is on sys.path. See backend/core/ouroboros/ui/presentation_mode.py.
@@ -195,26 +228,55 @@ _FORCE_OVERRIDE_KEYS = frozenset({
 
 
 def _load_env_files() -> None:
-    """Load .env files from project root and backend/.
+    """Apply the two overlays the canonical loader does not cover.
 
-    API keys (ANTHROPIC_API_KEY, DOUBLEWORD_API_KEY) are force-overridden
-    from .env so that stale shell exports don't cause silent 401 errors.
-    All other variables use setdefault (shell wins).
+    ## This is no longer a parser
+
+    It used to be a second, hand-rolled ``.env`` reader living alongside
+    ``backend.core.env_bootstrap.load_env_once`` -- two implementations of
+    one job, and they did not agree: the canonical loader is strictly
+    ``override=False`` while this one force-overrode the API keys. A
+    variable's effective value therefore depended on which loader last
+    touched it, and nothing said so.
+
+    Splitting a difference in policy from a difference in CODE is the
+    whole fix. The canonical loader now runs at the top of this module,
+    before any ``backend.*`` import, so a module reading ``os.environ`` at
+    import scope sees a populated environment. What remains here is only
+    what that loader deliberately does not do, each stated as a rule:
+
+      1. ``backend/.env`` — a second file the canonical loader does not
+         know about. Same precedence: the environment wins.
+      2. The API keys — the ONE documented exception, where the file beats
+         a stale shell export, because an expired key exported months ago
+         produces a silent 401 rather than an error anyone can read.
+
+    Parsing itself is `dotenv.dotenv_values`, the same library the
+    canonical loader uses, so quoting, ``export`` prefixes and escapes are
+    handled one way. The previous `.strip("'\\"")` mangled any value that
+    legitimately contained a quote. NEVER raises.
     """
+    try:
+        _load_env_once()          # idempotent; already ran at module top
+    except Exception:  # noqa: BLE001 — config must never block boot
+        pass
+    try:
+        from dotenv import dotenv_values  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — dependency optional, as upstream
+        return
     for env_path in (_PROJECT_ROOT / ".env", _PROJECT_ROOT / "backend" / ".env"):
-        if not env_path.exists():
-            continue
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
+        try:
+            if not env_path.exists():
                 continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip("'\"")
-            if key in _FORCE_OVERRIDE_KEYS:
-                os.environ[key] = value  # .env wins for API keys
-            else:
-                os.environ.setdefault(key, value)
+            for key, value in (dotenv_values(env_path) or {}).items():
+                if not key or value is None:
+                    continue
+                if key in _FORCE_OVERRIDE_KEYS:
+                    os.environ[key] = value      # the file wins for API keys
+                else:
+                    os.environ.setdefault(key, value)
+        except Exception:  # noqa: BLE001 — a bad overlay is not fatal
+            continue
 
 
 def _check_env(key: str) -> str:
@@ -929,6 +991,102 @@ def _check_api_keys_or_die() -> None:
     print(f"  {_RED}with a reachable engine at JARVIS_LOCAL_MODEL_BASE_URL{_RESET}")
     print(f"  {_RED}(currently unreachable, or serving no models).{_RESET}\n")
     sys.exit(1)
+
+
+#: POSIX ``sysexits.h`` EX_CONFIG. The repo already speaks this dialect --
+#: `ensure_daemon` reads 75 (EX_TEMPFAIL) as a single-flight refusal -- so a
+#: configuration fault gets its own code rather than joining the generic 1.
+#: A client can then say WHY the organism declined instead of "did not come
+#: up", which is the difference between a fix and a debugging session.
+EXIT_MODEL_PIN_UNAVAILABLE = 78
+
+
+def _validate_model_pin_or_die() -> None:
+    """FATAL preflight: the pinned model must be one this node serves.
+
+    ## Why this is fatal rather than a warning
+
+    The selector is fail-soft by contract and substitutes "largest by
+    size" when a pin is not served. On the hot path that is right -- a
+    grader must never stop a running loop. At BOOT it is wrong: every
+    subsequent generation answers from a model the operator did not
+    choose, a fine-tune A/B silently compares the base against itself,
+    and the only trace is one WARNING line in a log nobody tails.
+
+    ## What counts as evidence
+
+    Only a registry that ANSWERED and does not contain the pin. An
+    unreachable or empty registry is "we could not ask", and
+    `_check_api_keys_or_die` already dies loudly on exactly that -- so a
+    second opinion here would turn a transient blip into a self-kill
+    while adding nothing. This gate therefore runs AFTER that one and
+    treats silence as not-proven rather than as absence.
+
+    No pin means no promise to keep, and auto-selection stands.
+    """
+    try:
+        from backend.core.ouroboros.governance.candidate_generator import (
+            ModelPinUnavailable, resolve_active_model, set_active_model_tag,
+        )
+    except Exception as exc:  # noqa: BLE001 — never block boot on the gate
+        print(f"  (model pin gate unavailable: {type(exc).__name__}: {exc})")
+        return
+
+    pin = (os.environ.get("JARVIS_LOCAL_MODEL_NAME") or "").strip()
+    tags = _local_registry_tags()
+    if tags is None:
+        # Not proven either way. Say so plainly rather than implying the
+        # pin was honoured.
+        if pin:
+            print(f"  model pin: {pin} (registry unreachable — unverified)")
+        return
+    try:
+        resolved = resolve_active_model(tags, pin=pin)
+    except ModelPinUnavailable as exc:
+        served = "\n".join(f"      - {s}" for s in exc.served) or "      (none)"
+        print(f"\n  {_RED}{_BOLD}FATAL: pinned model is not served.{_RESET}")
+        print(f"  {_RED}component : model_selection{_RESET}")
+        print(f"  {_RED}pinned    : {exc.pin}{_RESET}")
+        print(f"  {_RED}source    : JARVIS_LOCAL_MODEL_NAME "
+              f"(environment, else .env){_RESET}")
+        print(f"  {_RED}served    :{_RESET}\n{_RED}{served}{_RESET}")
+        print(f"  {_RED}action    : refusing to start. Falling back to another "
+              f"model would answer{_RESET}")
+        print(f"  {_RED}            every request from a model you did not "
+              f"choose, silently.{_RESET}")
+        print(f"  {_RED}fix       : `ollama pull {exc.pin}`, or correct "
+              f"JARVIS_LOCAL_MODEL_NAME.{_RESET}\n")
+        sys.exit(EXIT_MODEL_PIN_UNAVAILABLE)
+    set_active_model_tag(resolved)
+    if resolved:
+        origin = "pinned" if pin else "auto-selected (no pin)"
+        print(f"  Model: {_BOLD}{resolved}{_RESET} ({origin})")
+
+
+def _local_registry_tags() -> "Optional[dict]":
+    """The engine's ``/api/tags`` payload, or None when it cannot be read.
+
+    None is "could not ask", never "serves nothing" — the caller's whole
+    correctness rests on that distinction. Reuses `_local_generation_lane`
+    for the endpoint so this and the lane preflight can never disagree
+    about where local lives. NEVER raises.
+    """
+    try:
+        base = _local_generation_lane()
+        if not base:
+            return None
+        import json as _json
+        import urllib.request as _url
+        try:
+            timeout = float(os.environ.get("JARVIS_PREFLIGHT_LOCAL_PROBE_S", "4"))
+        except (TypeError, ValueError):
+            timeout = 4.0
+        with _url.urlopen(base.rstrip("/") + "/api/tags", timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            return _json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 — unreadable registry == not proven
+        return None
 
 
 def _print_preflight() -> None:
@@ -1799,6 +1957,11 @@ def main(argv: "list[str] | None" = None) -> None:
     # ------------------------------------------------------------------
     _mode = resolve_presentation_mode()
     _check_api_keys_or_die()
+    # AFTER the lane gate, never before: "the engine cannot serve" and "the
+    # engine serves, but not what you asked for" are different faults, and
+    # the first already has an owner. Running this first would report a
+    # missing model when the truth is a stopped engine.
+    _validate_model_pin_or_die()
 
     # ------------------------------------------------------------------
     # Zombie reaper — kill lingering battle tests from prior sessions

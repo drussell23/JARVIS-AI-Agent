@@ -605,18 +605,24 @@ def _render_hydration(console: Any, payload: dict) -> None:
         # model is the one thing that actually changes between sessions --
         # base vs fine-tuned adapter, and no way to tell them apart.
         #
-        # Read through `_model_pin()`, the same accessor the generation lane
-        # uses, so the banner cannot disagree with what actually answers.
-        # Empty means no explicit pin (auto-select), and the field is then
-        # omitted rather than guessed at: naming a model we are not certain
-        # of is worse than naming none.
-        try:
-            from backend.core.ouroboros.governance.candidate_generator import (
-                _model_pin as _pin,
-            )
-            _model = _pin()
-        except Exception:  # noqa: BLE001 — a banner never breaks an attach
-            _model = ""
+        # FROM THE DAEMON, never from this process.
+        #
+        # This read `_model_pin()` — the CLIENT's own environment. The
+        # client is a different process: it does not load `.env`, so a
+        # correctly pinned daemon rendered no model at all (measured
+        # 2026-09-06: the banner showed `attached phase IDLE 22 sensors ·
+        # cost $0.00/$2.50` while the organism answered from a fine-tune),
+        # and a stale client export would have named the wrong model with
+        # full confidence. A banner that guesses is worse than one that is
+        # silent, and this one could do both.
+        #
+        # The hydration frame now carries the tag the generation lane
+        # RESOLVED at its boot gate, against a registry that answered. The
+        # client renders what it is told. Absent or empty means the daemon
+        # has not resolved one, and the field is omitted rather than
+        # back-filled from here — falling back to the local environment is
+        # exactly the guess this replaces.
+        _model = str(payload.get("model") or "").strip()
         if _model:
             head.append(f"  {_dot}  model ", style=_muted)
             head.append(_model, style=_body)

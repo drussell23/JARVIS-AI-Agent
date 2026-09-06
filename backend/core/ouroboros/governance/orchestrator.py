@@ -2342,6 +2342,84 @@ class GovernedOrchestrator:
             )
             return None
 
+    def _review_downlevel_hard_blocked(self, ctx: Any) -> bool:
+        """The base-tier hard sources that NO later GATE gate re-clamps: the
+        self-modification cage and the delegated-provenance (sanctioned-goal)
+        ceiling. A subagent APPLY down-level must never relax an op held for
+        either. Every OTHER hard gate (similarity, frozen, risk ceiling,
+        SemanticGuardian, mutation, MIN_RISK_TIER floor) runs AFTER the review
+        seam and re-clamps on its own, so this check is deliberately narrow.
+        FAIL-CLOSED: any doubt returns True (block the relax). NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.trust_calibration import (
+                _op_touches_cage,
+            )
+            _files = [str(f) for f in (getattr(ctx, "target_files", ()) or ())]
+            if _op_touches_cage(_files):
+                return True
+            # A delegated-provenance op (operator /goal, verify_provenance_claim
+            # -> "ceiling APPROVAL_REQUIRED, never auto-apply") carries an
+            # EXPLICIT human-approval ceiling the operator chose; a subagent must
+            # not reason around it. Presence of the claim in the intake evidence
+            # is sufficient — a false positive fails CLOSED (keeps the human).
+            _ev = str(getattr(ctx, "intake_evidence_json", "") or "")
+            if _ev and '"provenance"' in _ev:
+                return True
+            return False
+        except Exception:  # noqa: BLE001 — a doubt about provenance blocks it
+            return True
+
+    async def _apply_review_gate(
+        self, ctx: Any, best_candidate: Any, risk_tier: Any,
+    ) -> Any:
+        """Graduate the REVIEW subagent into the risk gate — the SINGLE seam the
+        extracted ``gate_runner`` and its inline twin both call, applied at GATE
+        ENTRY so the relax-then-reclamp state machine does the rest.
+
+        Dispatches the REVIEW shadow once and folds its verdict into the tier:
+
+          * **REVIEW-enforce** (``JARVIS_REVIEW_SUBAGENT_ENFORCE``, default on):
+            a REJECT / ambiguous / reservations verdict ESCALATES the tier via
+            the same stricter-wins clamp SemanticGuardian uses — the safety veto.
+          * **APPLY-authorize** (``JARVIS_SUBAGENT_APPLY_AUTHORIZE``, default on):
+            a CLEAN, unanimous, failure-free approve DOWN-LEVELS a ROUTINE
+            ``APPROVAL_REQUIRED`` to ``NOTIFY_APPLY`` (auto-apply WITH a diff
+            notice), authorizing VERIFY->APPLY without a human -- but NEVER when
+            the tier is owned by the cage or the provenance ceiling
+            (:meth:`_review_downlevel_hard_blocked`), and never below
+            ``NOTIFY_APPLY``. Because this runs BEFORE similarity / frozen /
+            ceiling / SemanticGuardian / mutation / the MIN_RISK_TIER floor,
+            each of those re-clamps a wrongly-relaxed tier on its own — the
+            down-level cannot outrun a hard gate.
+
+        Returns the (possibly-adjusted) ``risk_tier``. Fail-SOFT on a subsystem
+        error (tier unchanged); the verdict-level decisions are fail-CLOSED
+        inside ``shadow_enforce``. NEVER raises into GATE."""
+        try:
+            from backend.core.ouroboros.governance.shadow_enforce import (
+                aggregate_to_tier_floor,
+                authorize_apply_downlevel,
+                escalate_risk_tier,
+                review_enforce_enabled,
+            )
+            _agg = await self._run_review_shadow(ctx, best_candidate)
+            if _agg is None:
+                return risk_tier
+            if review_enforce_enabled():
+                risk_tier = escalate_risk_tier(
+                    risk_tier, aggregate_to_tier_floor(_agg),
+                )
+            risk_tier = authorize_apply_downlevel(
+                risk_tier, _agg,
+                hard_gate_present=self._review_downlevel_hard_blocked(ctx),
+            )
+            return risk_tier
+        except Exception:  # noqa: BLE001 — the review gate never breaks GATE
+            logger.debug(
+                "[Orchestrator] review gate skipped (fail-soft)", exc_info=True,
+            )
+            return risk_tier
+
     async def _run_plan_shadow(self, ctx: Any) -> Any:
         """Phase B PLAN-shadow — AgenticPlanSubagent dispatch running
         alongside the legacy ``PlanGenerator`` as an observer.
@@ -9344,6 +9422,14 @@ class GovernedOrchestrator:
                     logger.info("[TrustCalibration] GATE %s", _trust_why)
             except Exception:  # noqa: BLE001 — trust widening must never break GATE
                 pass
+
+            # ---- REVIEW subagent → risk gate (graduated, Phase 1b) ----
+            # Inline-twin parity with gate_runner: the SAME seam, at GATE entry,
+            # so every hard gate below re-clamps a relaxed tier. See
+            # _apply_review_gate. The legacy per-verdict REVIEW-enforce block
+            # further down is retired in favour of this single call.
+            risk_tier = await self._apply_review_gate(ctx, best_candidate, risk_tier)
+
             allowed, reason = self._stack.can_write(
                 {"files": list(ctx.target_files)}
             )
@@ -9807,48 +9893,14 @@ class GovernedOrchestrator:
                     risk_tier = RiskTier.APPROVAL_REQUIRED
                     _guardian_findings = [_SENTINEL_GUARDIAN_CRASH]
 
-            # ---- REVIEW subagent (Slice 1a SHADOW + enforce promotion) ----
-            # Gated by JARVIS_REVIEW_SUBAGENT_SHADOW (dispatch) + optionally
-            # JARVIS_REVIEW_SUBAGENT_ENFORCE (default false — gating). The
-            # shadow always emits verdict telemetry; when enforce is OFF the
-            # FSM proceeds to GATE unchanged (byte-identical observer). When
-            # enforce is ON the worst-of-N verdict becomes a HARD risk-tier
-            # gate via the SAME stricter-wins escalation SemanticGuardian uses
-            # (REJECT / ambiguous -> APPROVAL_REQUIRED, reservations ->
-            # NOTIFY_APPLY). Fail-CLOSED on the verdict; fail-SOFT on the
-            # subsystem (a dispatch crash returns None -> no gating, op alive).
-            _review_aggregate = await self._run_review_shadow(ctx, best_candidate)
-            try:
-                from backend.core.ouroboros.governance.shadow_enforce import (
-                    aggregate_to_tier_floor as _agg_to_floor,
-                    escalate_risk_tier as _escalate_tier,
-                    review_enforce_enabled as _review_enforce_on,
-                )
-                if (
-                    _review_enforce_on()
-                    and _review_aggregate is not None
-                    and best_candidate is not None
-                ):
-                    _rv_floor = _agg_to_floor(_review_aggregate)
-                    _rv_before = risk_tier.name
-                    risk_tier = _escalate_tier(risk_tier, _rv_floor)
-                    logger.info(
-                        "[REVIEW-ENFORCE] op=%s aggregate=%s floor=%s "
-                        "risk_before=%s risk_after=%s "
-                        "(verdict gates FSM via existing risk-tier escalation)",
-                        getattr(ctx, "op_id", "?"),
-                        _review_aggregate.aggregate,
-                        _rv_floor or "<none>",
-                        _rv_before,
-                        risk_tier.name,
-                    )
-            except Exception:
-                # Fail-SOFT: an enforce-wiring error must never break the op.
-                # Conservative: leave risk_tier unchanged + log.
-                logger.debug(
-                    "[Orchestrator] REVIEW-enforce gating skipped (fail-soft)",
-                    exc_info=True,
-                )
+            # ---- REVIEW subagent → risk gate ----
+            # Retired: the REVIEW verdict is now dispatched + folded into the
+            # tier once, at GATE ENTRY, via self._apply_review_gate (escalate on
+            # reject + authorize a routine approval down-level on a clean
+            # approve), identically on this inline twin and the extracted
+            # gate_runner. Re-running it here would double the review cost and
+            # could re-lower a tier a hard gate between entry and here just
+            # raised, so it is NOT repeated.
 
             # ---- MutationGate: APPLY-phase execution boundary (cached) ----
             #

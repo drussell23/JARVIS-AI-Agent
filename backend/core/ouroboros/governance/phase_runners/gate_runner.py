@@ -140,6 +140,16 @@ class GATERunner(PhaseRunner):
         except Exception:  # noqa: BLE001 — trust widening must never break GATE
             pass
 
+        # ---- REVIEW subagent → risk gate (graduated, Phase 1b) ----
+        # The ONE seam (shared with the inline twin) that folds the REVIEW
+        # verdict into the tier: REJECT escalates (safety veto), a CLEAN approve
+        # down-levels a ROUTINE APPROVAL_REQUIRED to NOTIFY_APPLY. Applied HERE
+        # at GATE entry, BEFORE similarity / frozen / ceiling / SemanticGuardian
+        # / mutation / the MIN_RISK_TIER floor, so each re-clamps a relaxed tier
+        # on its own — the down-level can never outrun a hard gate. NEVER breaks
+        # GATE (fail-soft inside).
+        risk_tier = await orch._apply_review_gate(ctx, best_candidate, risk_tier)
+
         # Resolve _human_is_watching through the orchestrator module
         # namespace so env overrides remain test-patchable.
         from backend.core.ouroboros.governance.orchestrator import (
@@ -585,8 +595,12 @@ class GATERunner(PhaseRunner):
                 risk_tier = RiskTier.APPROVAL_REQUIRED
                 _guardian_findings = [_SENTINEL_GUARDIAN_CRASH]
 
-        # ---- REVIEW subagent (shadow observer) ----
-        await orch._run_review_shadow(ctx, best_candidate)
+        # ---- REVIEW subagent → risk gate ----
+        # Dispatched + folded into the tier at GATE ENTRY above (see
+        # orch._apply_review_gate) so the hard gates between here and there
+        # re-clamp a relaxed tier. Re-dispatching here would double the review
+        # cost and could re-lower a tier a hard gate just raised, so it is NOT
+        # repeated — this comment marks the moved seam.
 
         # ---- MutationGate: APPLY-phase execution boundary (cached) ----
         if best_candidate is not None:

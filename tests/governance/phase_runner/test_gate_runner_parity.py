@@ -107,6 +107,17 @@ class _FakeOrchestrator:
     async def _run_review_shadow(self, ctx, best_candidate):
         self.review_shadow_calls += 1
 
+    async def _apply_review_gate(self, ctx, best_candidate, risk_tier):
+        # Phase 1b seam: dispatch the review once and fold its verdict into the
+        # tier. The fake review returns None (no aggregate), so this is a no-op
+        # on the tier — the real fail-soft path — while preserving the
+        # review-shadow call count the parity harness checks.
+        await self._run_review_shadow(ctx, best_candidate)
+        return risk_tier
+
+    def _review_downlevel_hard_blocked(self, ctx) -> bool:
+        return False
+
     def _is_cancel_requested(self, op_id: str) -> bool:
         return self._cancel_requested
 

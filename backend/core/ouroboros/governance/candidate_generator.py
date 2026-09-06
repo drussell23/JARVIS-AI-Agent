@@ -2958,6 +2958,39 @@ def active_model_tag() -> str:
     return _ACTIVE_MODEL_TAG
 
 
+def resolve_display_model() -> str:
+    """The model to NAME as the one answering — for the cockpit banner.
+
+    ``active_model_tag`` is the ground truth once the boot gate has run
+    against a registry that answered; but a registry BLIP at boot (the gate
+    treats "could not ask" as not-proven and declines to set a tag) or an
+    idle daemon that has not resolved yet would then render no model at all --
+    the confusing blank the operator reported. So this falls back, DAEMON-SIDE
+    and config-driven, to the generation lane's CONFIGURED model (the local
+    lane's ``JARVIS_LOCAL_MODEL_NAME`` when that lane is enabled), then to the
+    pin. Never the client's environment, never a hardcoded name. Empty only
+    when there is genuinely no lane to name. NEVER raises.
+    """
+    tag = active_model_tag()
+    if tag:
+        return tag
+    try:
+        from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415,E501
+            LocalConfig,
+            local_prime_enabled,
+        )
+        if local_prime_enabled():
+            name = (LocalConfig.from_env().model_name or "").strip()
+            if name:
+                return name
+    except Exception:  # noqa: BLE001 -- a banner never breaks on a cold import
+        pass
+    try:
+        return _model_pin().strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _parse_served_model(tags: Optional[Dict[str, Any]]) -> Optional[str]:
     """From an ollama ``/api/tags`` payload, the model to dispatch to --
     the operator's pin when the node serves it, else the largest by

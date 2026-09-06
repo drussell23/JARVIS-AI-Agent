@@ -158,6 +158,65 @@ def mirror_stream_enabled() -> bool:
     ).strip().lower() not in ("0", "false", "no", "off")
 
 
+#: Which backend carries the in-flight tail to attached cockpits. ``None``
+#: = this renderer (the foreground TTY case, unchanged). The harness names
+#: another backend when one is registered that publishes the same frame —
+#: the default per-op transport — so a foreground run with a cockpit
+#: attached does not send every frame twice.
+_INFLIGHT_PUBLISHER: Optional[str] = None
+_STREAM_RENDERER_PUBLISHER: str = "stream_renderer"
+
+
+def set_inflight_publisher(name: Optional[str]) -> None:
+    """Name the ONE backend that publishes ``stream_inflight`` frames."""
+    global _INFLIGHT_PUBLISHER  # noqa: PLW0603
+    _INFLIGHT_PUBLISHER = str(name) if name else None
+
+
+def owns_inflight_publishing(name: str) -> bool:
+    """Whether ``name`` is the backend that carries the tail right now."""
+    return _INFLIGHT_PUBLISHER is None or _INFLIGHT_PUBLISHER == name
+
+
+def publish_inflight_tail(op_id: str, tail: str, *, done: bool = False) -> bool:
+    """The ONE producer of the ``stream_inflight`` frame.
+
+    Carried on the telemetry lane rather than the markup lane because it is
+    STATE, not a transcript entry: the last frame wins, and a dropped one
+    costs a frame of smoothness rather than a lost line. The daemon's own
+    in-flight registry is fed FIRST — `publish_telemetry_global` is a no-op
+    with nobody attached, which is exactly when the daemon's own cockpit is
+    the surface being looked at. Returns whether a cockpit received it.
+
+    Extracted from the renderer (2026-09-06) because the renderer is
+    TTY-gated: a headless daemon never constructs it, so the organism's
+    generation was invisible on every attached cockpit — the exact state
+    this frame exists to end. Any backend may now carry the tail.
+    NEVER raises.
+    """
+    frame = {
+        "kind": "stream_inflight",
+        "op_id": str(op_id or ""),
+        "text": "" if done else str(tail or "")[-_INFLIGHT_MAX_CHARS:],
+        "done": bool(done),
+    }
+    try:
+        from backend.core.ouroboros.battle_test.inflight_registry import (  # noqa: E501,PLC0415
+            note_inflight_frame,
+        )
+        note_inflight_frame(frame)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from backend.core.ouroboros.battle_test.cockpit_attach import (  # noqa: PLC0415
+            publish_telemetry_global,
+        )
+        return bool(publish_telemetry_global(frame))
+    except Exception:  # noqa: BLE001
+        logger.debug("[StreamRender] inflight publish degraded", exc_info=True)
+        return False
+
+
 def local_echo_enabled() -> bool:
     """Default ON. Whether a foreground run echoes the stream to its OWN
     terminal when no cockpit is attached over the bridge.
@@ -696,38 +755,13 @@ class StreamRenderer:
         try:
             if not mirror_stream_enabled():
                 return
+            if not owns_inflight_publishing(_STREAM_RENDERER_PUBLISHER):
+                return          # another backend carries the tail to cockpits
             tail = "" if done else self._buffer[self._mirrored_offset:]
             if tail == self._last_inflight and not done:
                 return          # nothing new — do not spend a frame
             self._last_inflight = tail
-            from backend.core.ouroboros.battle_test.cockpit_attach import (
-                publish_telemetry_global,
-            )
-            frame = {
-                "kind": "stream_inflight",
-                "op_id": str(self._op_id or ""),
-                # Bounded: the wrap happens on the client, which knows its
-                # width, but an unbounded tail would still cross the bridge
-                # every frame. A sentence that long has stopped being one.
-                "text": tail[-_INFLIGHT_MAX_CHARS:],
-                "done": bool(done),
-            }
-            # Recorded HERE, before the transport decision, and handed the
-            # very dict that is about to cross the wire.
-            #
-            # `publish_telemetry_global` returns early when no cockpit is
-            # attached, so a daemon with nobody watching publishes nothing —
-            # which is exactly when its OWN cockpit is the surface being
-            # looked at. Feeding the registry after that call would give the
-            # daemon a strip that works only while someone else is watching.
-            try:
-                from backend.core.ouroboros.battle_test.inflight_registry import (  # noqa: E501
-                    note_inflight_frame,
-                )
-                note_inflight_frame(frame)
-            except Exception:  # noqa: BLE001
-                pass
-            publish_telemetry_global(frame)
+            publish_inflight_tail(str(self._op_id or ""), tail, done=bool(done))
         except Exception:  # noqa: BLE001
             logger.debug(
                 "[StreamRender] op=%s inflight degraded", self._op_id,

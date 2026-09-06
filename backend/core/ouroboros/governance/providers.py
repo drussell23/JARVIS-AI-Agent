@@ -5758,6 +5758,64 @@ class _AdmissionTicket:
         return bool(self.brain_id) or bool(self.reservation_id)
 
 
+#: Whether a client's ``generate`` can take ``on_token`` — decided ONCE per
+#: client class by its signature, never by trying and catching a TypeError
+#: mid-generation. The local client names it; the cloud PrimeClient does not.
+_ON_TOKEN_ACCEPTANCE: Dict[type, bool] = {}
+
+
+def _client_accepts_on_token(client: Any) -> bool:
+    cls = type(client)
+    known = _ON_TOKEN_ACCEPTANCE.get(cls)
+    if known is not None:
+        return known
+    accepts = False
+    try:
+        import inspect  # noqa: PLC0415
+        params = inspect.signature(client.generate).parameters
+        accepts = "on_token" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except Exception:  # noqa: BLE001 — an unknown seat streams nothing
+        accepts = False
+    _ON_TOKEN_ACCEPTANCE[cls] = accepts
+    return accepts
+
+
+def _local_stream_kw(client: Any, op_id: object) -> Dict[str, Any]:
+    """A reasoning stream for ONE local generation, as a kwarg dict.
+
+    The same conductor seam the Claude provider streams through
+    (``get_reasoning_stream_callback``), so the operator sees the local
+    model write exactly as they would see Claude — through whichever
+    backends the harness registered. ``{}`` when the client cannot take the
+    callback, the substrate is off, or no conductor is registered: the
+    call is then byte-identical to before. NEVER raises."""
+    if not _client_accepts_on_token(client):
+        return {}
+    try:
+        from backend.core.ouroboros.governance.render_primitives import (  # noqa: PLC0415
+            get_reasoning_stream_callback,
+        )
+        cb = get_reasoning_stream_callback(
+            op_id=str(op_id or "") or "op", provider="local",
+        )
+    except Exception:  # noqa: BLE001
+        return {}
+    return {"on_token": cb} if cb is not None else {}
+
+
+def _end_local_stream(stream_kw: Dict[str, Any]) -> None:
+    """Close the stream opened by :func:`_local_stream_kw` — on EVERY exit
+    path, or the cockpit's in-flight tail never clears. NEVER raises."""
+    end = getattr(stream_kw.get("on_token"), "end_callback", None)
+    if callable(end):
+        try:
+            end()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class PrimeProvider:
     """CandidateProvider adapter wrapping PrimeClient.generate().
 
@@ -6186,6 +6244,9 @@ class PrimeProvider:
             # where the admission ledger learns: an OOM here raises this
             # brain's margin, a clean load retires a prior one. Purely
             # additive — the recording never alters control flow.
+            _stream_kw = _local_stream_kw(
+                self._client, getattr(context, "op_id", ""),
+            )
             try:
                 resp = await self._client.generate(
                     prompt=p,
@@ -6195,6 +6256,7 @@ class PrimeProvider:
                     model_name=_brain_model,
                     task_profile=_task_profile,
                     **_sampling_kw,
+                    **_stream_kw,
                 )
             except BaseException as _load_err:
                 try:
@@ -6215,7 +6277,9 @@ class PrimeProvider:
                         _lma_out.release_reservation(admission.reservation_id)
                 except Exception:  # noqa: BLE001 — telemetry never masks a fault
                     pass
+                _end_local_stream(_stream_kw)
                 raise
+            _end_local_stream(_stream_kw)
             try:
                 from backend.core.ouroboros.governance import (
                     local_model_admission as _lma_out,
@@ -6433,14 +6497,21 @@ class PrimeProvider:
                         "(round %d)", _remaining, tool_rounds,
                     )
                     break
-                resp = await self._client.generate(
-                    prompt=current_prompt,
-                    system_prompt=_CODEGEN_SYSTEM_PROMPT,
-                    max_tokens=_retry_max_tokens,
-                    temperature=0.2,
-                    model_name=_brain_model,
-                    task_profile=_task_profile,
+                _stream_kw = _local_stream_kw(
+                    self._client, getattr(context, "op_id", ""),
                 )
+                try:
+                    resp = await self._client.generate(
+                        prompt=current_prompt,
+                        system_prompt=_CODEGEN_SYSTEM_PROMPT,
+                        max_tokens=_retry_max_tokens,
+                        temperature=0.2,
+                        model_name=_brain_model,
+                        task_profile=_task_profile,
+                        **_stream_kw,
+                    )
+                finally:
+                    _end_local_stream(_stream_kw)
                 _last_response[0] = resp
                 raw = resp.content
                 tool_calls = _parse_tool_call_response(raw)

@@ -1663,7 +1663,8 @@ class LocalPrimeClient:
                        stream: "Optional[bool]" = None,
                        prefill: str = "",
                        sampling: "Optional[Any]" = None,
-                       response_format: Any = RESPONSE_FORMAT_LADDER) -> LocalCompletion:
+                       response_format: Any = RESPONSE_FORMAT_LADDER,
+                       on_token: "Optional[Any]" = None) -> LocalCompletion:
         sess = await self._ensure_session()
         url = chat_endpoint(self._cfg)
         # Dynamic Cognitive Compression + num_ctx injection (Context-Hardware
@@ -1772,7 +1773,7 @@ class LocalPrimeClient:
             return await self._complete_streaming(
                 sess, url, body, prefill=_eff_prefill,
                 prompt_tokens=prompt_tokens, temperature=temperature,
-                sampling=sampling,
+                sampling=sampling, on_token=on_token,
             )
 
         t0 = time.monotonic()
@@ -1856,7 +1857,8 @@ class LocalPrimeClient:
                                   *, prefill: str = "",
                                   prompt_tokens: "Optional[int]" = None,
                                   temperature: "Optional[float]" = None,
-                                  sampling: "Optional[Any]" = None) -> LocalCompletion:
+                                  sampling: "Optional[Any]" = None,
+                                  on_token: "Optional[Any]" = None) -> LocalCompletion:
         """Streaming generation with the Asynchronous Inter-Token Watchdog +
         cooperative shutdown. Reads the SSE stream chunk-by-chunk; each ``readline``
         is bounded by the inter-token timeout (NOT the total duration). Between
@@ -2071,6 +2073,17 @@ class LocalPrimeClient:
                             first = False
                         parts.append(delta)
                         _emit_stream_token(delta)
+                        # The CALLER's view of the stream — the render
+                        # conductor, when the dispatcher opened a reasoning
+                        # stream for this generation. Until this existed the
+                        # local lane's tokens reached stdout and the watchdog
+                        # and nothing that could show an operator the model
+                        # writing. A render fault never breaks the stream.
+                        if on_token is not None:
+                            try:
+                                on_token(delta)
+                            except Exception:  # noqa: BLE001
+                                pass
             finally:
                 try:
                     await _req_cm.__aexit__(None, None, None)
@@ -2101,7 +2114,8 @@ class LocalPrimeClient:
                                temperature: float = 0.2,
                                max_tokens: "Optional[int]" = None,
                                sampling: "Optional[Any]" = None,
-                               response_format: Any = RESPONSE_FORMAT_LADDER) -> LocalCompletion:
+                               response_format: Any = RESPONSE_FORMAT_LADDER,
+                               on_token: "Optional[Any]" = None) -> LocalCompletion:
         # HEAVY (num_ctx) STREAMING path: deprecate the total-duration timeout. The
         # Inter-Token Watchdog inside _complete_streaming is the sole guard -- a
         # model that keeps emitting tokens runs indefinitely; only a STALL trips it.
@@ -2116,6 +2130,7 @@ class LocalPrimeClient:
                 system=system, user=user, prompt_tokens=prompt_tokens,
                 temperature=temperature, max_tokens=max_tokens, stream=True,
                 sampling=sampling, response_format=response_format,
+                on_token=on_token,
             )
 
         # SURVIVAL / non-streaming path: legacy total-duration adaptive timeout.
@@ -2132,7 +2147,8 @@ class LocalPrimeClient:
             return await asyncio.wait_for(
                 self.complete(system=system, user=user, prompt_tokens=prompt_tokens,
                               temperature=temperature, max_tokens=max_tokens,
-                              sampling=sampling, response_format=response_format),
+                              sampling=sampling, response_format=response_format,
+                              on_token=on_token),
                 timeout=timeout_ms / 1000.0,
             )
         except asyncio.TimeoutError as e:
@@ -2148,6 +2164,7 @@ class LocalPrimeClient:
                        task_profile: "Optional[Any]" = None,
                        sampling: "Optional[Any]" = None,
                        response_format: Any = RESPONSE_FORMAT_LADDER,
+                       on_token: "Optional[Any]" = None,
                        **kwargs: Any) -> Any:
         """Drop-in PrimeClient.generate adapter -> PrimeResponse (source=local_prime).
 
@@ -2172,6 +2189,7 @@ class LocalPrimeClient:
             system=sys_txt, user=prompt, prompt_tokens=est_tokens,
             temperature=temperature, max_tokens=max_tokens,
             sampling=sampling, response_format=response_format,
+            on_token=on_token,
         )
         return PrimeResponse(
             content=lc.text,

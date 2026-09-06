@@ -3301,6 +3301,10 @@ class BattleTestHarness:
                     serpent_flow=self._serpent_flow,
                     ouroboros_console=getattr(self, "_tui_console", None),
                     posture_provider=_posture_provider,
+                    # The default transport carries the token stream to
+                    # attached cockpits on a headless daemon, where no stream
+                    # renderer is ever constructed.
+                    per_op_transport=getattr(self, "_per_op_transport", None),
                 )
             except Exception as _wire_exc:  # noqa: BLE001 — defensive
                 logger.debug(

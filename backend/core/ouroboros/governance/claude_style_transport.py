@@ -123,6 +123,13 @@ _DEFAULT_DETAIL_LINES = 3
 #: Bound on remembered (op, round) preamble keys — a memory bound, not a
 #: behaviour; the same figure SerpentFlow keeps for the same dedup.
 _PREAMBLE_MEMORY = 512
+#: Coalescing window for in-flight stream frames: tokens arriving inside
+#: it ride one frame. The figure the stream renderer batches at.
+_FLAG_STREAM_FLUSH_MS = "JARVIS_CLAUDE_STYLE_STREAM_FLUSH_MS"
+_DEFAULT_STREAM_FLUSH_MS = 16
+#: Characters of a generation kept in memory per op while it streams — a
+#: memory bound (the wire frame carries only the renderer's tail cap).
+_STREAM_BUFFER_CHARS = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +250,11 @@ def detail_lines() -> int:
     return _read_int_flag(_FLAG_DETAIL_LINES, _DEFAULT_DETAIL_LINES, 1)
 
 
+def stream_flush_ms() -> int:
+    """Coalescing window for in-flight frames (``JARVIS_CLAUDE_STYLE_STREAM_FLUSH_MS``)."""
+    return _read_int_flag(_FLAG_STREAM_FLUSH_MS, _DEFAULT_STREAM_FLUSH_MS, 1)
+
+
 # ---------------------------------------------------------------------------
 # Per-op state
 # ---------------------------------------------------------------------------
@@ -261,6 +273,18 @@ class _OpState:
     risk_tier: str = ""
     target_files: tuple = ()
     goal: str = ""         # the full goal — the intent prompt wants all of it
+
+
+@dataclass
+class _StreamState:
+    """One generation being WRITTEN, as far as the cockpit has seen it."""
+
+    op_id: str
+    provider: str = ""
+    text: str = ""
+    last_flush: float = 0.0
+    flush_handle: Any = None
+    tokens: int = 0
 
 
 def _short_id(op_id: str) -> str:
@@ -381,6 +405,11 @@ class ClaudeStyleTransport:
         # to one 🗣 line per (op, round), exactly as SerpentFlow does.
         self._narration_tasks: Set[Any] = set()
         self._preamble_keys: "OrderedDict[tuple, None]" = OrderedDict()
+        # Token streams in flight, by op. Fed by the render conductor's
+        # PHASE_BEGIN / REASONING_TOKEN / PHASE_END triplet; carried to
+        # cockpits as `stream_inflight` frames through the ONE producer in
+        # stream_renderer, coalesced to `stream_flush_ms()`.
+        self._streams: Dict[str, _StreamState] = {}
         self._subscribe_narrative()
 
     # -- composer feed (CC2.1) --------------------------------------
@@ -980,18 +1009,22 @@ class ClaudeStyleTransport:
 
     name: str = "claude_style"
 
-    _HANDLED_KINDS: frozenset = frozenset({"FILE_REF"})
+    _HANDLED_KINDS: frozenset = frozenset({
+        "FILE_REF", "PHASE_BEGIN", "REASONING_TOKEN", "PHASE_END",
+    })
     _NO_OP_KINDS: frozenset = frozenset({
-        "PHASE_BEGIN", "PHASE_END", "REASONING_TOKEN",
         "STATUS_TICK", "MODAL_PROMPT", "MODAL_DISMISS",
         "THREAD_TURN", "BACKEND_RESET",
     })
 
     def notify(self, event: Any) -> None:
         """RenderBackend Protocol — receive RenderEvents from the
-        conductor. ClaudeStyleTransport only handles FILE_REF;
-        everything else is a documented no-op (CommProtocol surface
-        handles ops via send())."""
+        conductor. FILE_REF renders an Update block; the stream triplet
+        (PHASE_BEGIN / REASONING_TOKEN / PHASE_END) carries the model's
+        generation to attached cockpits as it is written — the surface
+        that had no producer on a headless daemon, because the only
+        producer was the TTY-gated stream renderer (2026-09-06). Other
+        kinds are documented no-ops (CommProtocol handles ops via send())."""
         if event is None:
             return
         try:
@@ -1001,10 +1034,96 @@ class ClaudeStyleTransport:
             )
             if kind_value == "FILE_REF":
                 self._handle_file_ref(event)
+            elif kind_value == "PHASE_BEGIN":
+                metadata = getattr(event, "metadata", None) or {}
+                self._stream_begin(
+                    str(getattr(event, "op_id", "") or ""),
+                    str(metadata.get("provider", "") or ""),
+                )
+            elif kind_value == "REASONING_TOKEN":
+                self._stream_token(
+                    str(getattr(event, "op_id", "") or ""),
+                    str(getattr(event, "content", "") or ""),
+                )
+            elif kind_value == "PHASE_END":
+                self._stream_end(str(getattr(event, "op_id", "") or ""))
         except Exception:  # noqa: BLE001 — defensive
             logger.debug(
                 "[claude_style_transport] notify failed", exc_info=True,
             )
+
+    # -- the token stream ---------------------------------------------
+
+    def _stream_begin(self, op_id: str, provider: str) -> None:
+        prior = self._streams.pop(op_id, None)
+        if prior is not None:
+            self._cancel_flush(prior)
+        self._streams[op_id] = _StreamState(op_id=op_id, provider=provider)
+
+    def _stream_token(self, op_id: str, content: str) -> None:
+        """Append one token and carry the tail to cockpits, coalesced.
+
+        The first token of a stream goes out at once — the operator sees
+        the model start writing the instant it does. Tokens inside the
+        flush window ride one frame; a trailing flush is scheduled on the
+        running loop so the last tokens before a pause never wait for the
+        next token to arrive. A stream that never announced itself is
+        opened here (a late-registered backend must not drop the op)."""
+        if not content:
+            return
+        state = self._streams.get(op_id)
+        if state is None:
+            state = _StreamState(op_id=op_id)
+            self._streams[op_id] = state
+        state.text = (state.text + content)[-_STREAM_BUFFER_CHARS:]
+        state.tokens += 1
+        window = stream_flush_ms() / 1000.0
+        elapsed = time.monotonic() - state.last_flush
+        if elapsed >= window:
+            self._stream_flush(op_id)
+            return
+        if state.flush_handle is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._stream_flush(op_id)       # no loop to defer on
+                return
+            state.flush_handle = loop.call_later(
+                max(0.0, window - elapsed), self._stream_flush, op_id,
+            )
+
+    def _stream_flush(self, op_id: str, *, done: bool = False) -> None:
+        state = self._streams.get(op_id)
+        if state is None:
+            return
+        self._cancel_flush(state)
+        state.last_flush = time.monotonic()
+        try:
+            from backend.core.ouroboros.battle_test.stream_renderer import (
+                publish_inflight_tail,
+            )
+            publish_inflight_tail(op_id, state.text, done=done)
+        except Exception:  # noqa: BLE001 — a dropped frame is a frame of smoothness
+            logger.debug("[claude_style_transport] inflight publish degraded",
+                         exc_info=True)
+
+    def _stream_end(self, op_id: str) -> None:
+        """The stream is complete: one final frame clears the tail (the
+        outcome lines that follow are the record; the tail was the view)."""
+        state = self._streams.get(op_id)
+        if state is None:
+            return
+        self._stream_flush(op_id, done=True)
+        self._streams.pop(op_id, None)
+
+    @staticmethod
+    def _cancel_flush(state: _StreamState) -> None:
+        handle, state.flush_handle = state.flush_handle, None
+        if handle is not None:
+            try:
+                handle.cancel()
+            except Exception:  # noqa: BLE001
+                pass
 
     def flush(self) -> None:
         """RenderBackend Protocol — no-op for this transport."""
@@ -1026,6 +1145,9 @@ class ClaudeStyleTransport:
                 task.cancel()
             except Exception:  # noqa: BLE001
                 pass
+        for state in tuple(self._streams.values()):
+            self._cancel_flush(state)
+        self._streams.clear()
 
     def _handle_file_ref(self, event: Any) -> None:
         """FILE_REF → render as Claude-style Update(<path>) block.
@@ -1186,6 +1308,24 @@ def register_flags(registry: Any) -> int:
                 "claude_style_transport.py"
             ),
             example=str(_DEFAULT_DETAIL_LINES),
+            since="v1.1",
+        ),
+        FlagSpec(
+            name=_FLAG_STREAM_FLUSH_MS,
+            type=FlagType.INT,
+            default=_DEFAULT_STREAM_FLUSH_MS,
+            description=(
+                "Coalescing window, in milliseconds, for the in-flight token "
+                "stream the Claude-style transport carries to attached "
+                "cockpits: tokens arriving inside it ride one frame. The "
+                "first token of a stream always goes out at once."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "claude_style_transport.py"
+            ),
+            example=str(_DEFAULT_STREAM_FLUSH_MS),
             since="v1.1",
         ),
     ]

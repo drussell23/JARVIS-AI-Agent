@@ -722,6 +722,7 @@ def wire_render_conductor(
     serpent_flow: Optional[Any] = None,
     ouroboros_console: Optional[Any] = None,
     posture_provider: Optional[Any] = None,
+    per_op_transport: Optional[Any] = None,
 ) -> Optional[Any]:
     """Construct a :class:`RenderConductor`, attach the supplied
     renderers as backends, install posture provider if given, and
@@ -775,6 +776,20 @@ def wire_render_conductor(
             conductor.add_backend(SerpentFlowBackend(serpent_flow))
         if ouroboros_console is not None:
             conductor.add_backend(OuroborosConsoleBackend(ouroboros_console))
+        if per_op_transport is not None and hasattr(per_op_transport, "notify"):
+            # The default per-op transport (ClaudeStyleTransport) is a
+            # RenderBackend that carries the stream triplet to attached
+            # cockpits without a TTY. It becomes THE in-flight publisher so
+            # a foreground run that also has a cockpit attached never sends
+            # a frame twice (the stream renderer keeps its local render).
+            conductor.add_backend(per_op_transport)
+            try:
+                from backend.core.ouroboros.battle_test.stream_renderer import (  # noqa: E501,PLC0415
+                    set_inflight_publisher,
+                )
+                set_inflight_publisher(getattr(per_op_transport, "name", "transport"))
+            except Exception:  # noqa: BLE001 — publisher election is best-effort
+                pass
         if posture_provider is not None:
             conductor.set_posture_provider(posture_provider)
     except Exception:  # noqa: BLE001 — defensive

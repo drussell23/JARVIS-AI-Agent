@@ -188,7 +188,9 @@ def test_the_local_client_hands_every_chunk_to_the_caller():
     for fn in (lid.LocalPrimeClient.complete, lid.LocalPrimeClient.complete_guarded,
                lid.LocalPrimeClient.generate):
         assert "on_token" in inspect.signature(fn).parameters
-    body = inspect.getsource(lid.LocalPrimeClient.complete)
+    assert "on_token" in inspect.signature(lid.LocalPrimeClient._complete_streaming).parameters
+    assert "on_token=on_token" in inspect.getsource(lid.LocalPrimeClient.complete)
+    body = inspect.getsource(lid.LocalPrimeClient._complete_streaming)
     assert "_emit_stream_token(delta)" in body and "on_token(delta)" in body
 
 

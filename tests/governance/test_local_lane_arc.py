@@ -28,6 +28,21 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _reset_generation_recursion_ledger():
+    """These tests reuse a FIXED op_id ("op-free-lane-test"), so the process-
+    global generation-recursion ledger (the shared per-op recovery budget,
+    Phase 3) would accumulate depth across tests and trip its ceiling mid-file.
+    Production op_ids are unique UUIDs with TTL expiry, so this isolation is a
+    test-only concern. Clear the ledger around every test."""
+    from backend.core.ouroboros.governance import generation_recursion_bound as _rb
+    with _rb._LOCK:
+        _rb._LEDGER.clear()
+    yield
+    with _rb._LOCK:
+        _rb._LEDGER.clear()
+
 LID = "backend.core.ouroboros.governance.local_inference_director"
 GW = "backend.core.ouroboros.governance.inference_gateway"
 CG = "backend.core.ouroboros.governance.candidate_generator"

@@ -7542,6 +7542,35 @@ class GovernedOrchestrator:
                         exc,
                     )
                     generate_retries_remaining -= 1
+                    # Unified recursion ceiling (Phase 3): the Iron-Gate retry
+                    # budget composes with the local syntax-repair under one
+                    # shared per-op bound. This is strictly ADDITIVE — it can
+                    # only force exhaustion EARLIER (when the SUM of recovery
+                    # attempts crosses the ceiling), never grant a retry the
+                    # native bound already refused. Gated; byte-identical off.
+                    try:
+                        from backend.core.ouroboros.governance.generation_recursion_bound import (  # noqa: E501
+                            enter_recovery,
+                            emit_generation_exhausted,
+                        )
+                        _rb_tok = enter_recovery(ctx.op_id)
+                        if _rb_tok.at_ceiling and generate_retries_remaining >= 0:
+                            logger.warning(
+                                "[Orchestrator] generation recursion ceiling "
+                                "reached (depth=%d bound=%d) — fail-closed [%s]",
+                                _rb_tok.depth, _rb_tok.bound, ctx.op_id,
+                            )
+                            generate_retries_remaining = -1
+                            emit_generation_exhausted(
+                                ctx.op_id, phase="GENERATE_RETRY",
+                                depth=_rb_tok.depth, bound=_rb_tok.bound,
+                                detail=str(exc)[:120],
+                            )
+                    except Exception:  # noqa: BLE001 — ceiling never breaks GEN
+                        logger.debug(
+                            "[Orchestrator] recursion-bound check degraded",
+                            exc_info=True,
+                        )
                     if generate_retries_remaining < 0:
                         # ── IMMEDIATE → STANDARD demotion ──
                         # If IMMEDIATE exhausted Claude retries, demote to
@@ -7637,6 +7666,15 @@ class GovernedOrchestrator:
                             OperationPhase.CANCELLED,
                             terminal_reason_code="generation_failed",
                         )
+                        # Drop the op's shared recovery counter on this terminal
+                        # (TTL is the backstop for non-terminal exits).
+                        try:
+                            from backend.core.ouroboros.governance.generation_recursion_bound import (  # noqa: E501
+                                reset as _reset_recursion,
+                            )
+                            _reset_recursion(ctx.op_id)
+                        except Exception:  # noqa: BLE001
+                            pass
                         await self._record_ledger(
                             ctx,
                             OperationState.FAILED,

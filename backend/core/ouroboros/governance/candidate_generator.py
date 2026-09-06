@@ -6704,6 +6704,40 @@ class CandidateGenerator:
                 # Already the retry. A second correction round is the loop this
                 # method exists to avoid.
                 raise
+            # Unified recursion ceiling (Phase 3): the one-shot syntax retry
+            # PARTICIPATES in the shared per-op recovery budget alongside the
+            # Iron-Gate GENERATE_RETRY loop, so their SUM cannot exceed the
+            # bound. The check itself never crashes a diagnosed syntax error —
+            # any ledger fault falls through to the existing one-shot behaviour;
+            # the terminating ``raise`` lives OUTSIDE the try so the swallow-all
+            # except can never suppress it.
+            _rb_ceiling = False
+            try:
+                from backend.core.ouroboros.governance.generation_recursion_bound import (  # noqa: E501,PLC0415
+                    enter_recovery,
+                    emit_generation_exhausted,
+                )
+                _rb = enter_recovery(getattr(context, "op_id", ""))
+                if _rb.at_ceiling:
+                    _rb_ceiling = True
+                    _oid = (getattr(context, "op_id", "") or "?")[:16]
+                    logger.info(
+                        "[CandidateGenerator] generation recursion ceiling "
+                        "reached (depth=%d bound=%d) — not spending a "
+                        "syntax-repair round [%s]",
+                        _rb.depth, _rb.bound, _oid,
+                    )
+                    emit_generation_exhausted(
+                        getattr(context, "op_id", ""), phase="SYNTAX_REPAIR",
+                        depth=_rb.depth, bound=_rb.bound,
+                        detail="syntax_repair_ceiling",
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — ledger fault must not crash
+                _rb_ceiling = False
+            if _rb_ceiling:
+                raise
             try:
                 from backend.core.ouroboros.governance.providers import (
                     _format_syntax_feedback,  # noqa: PLC0415

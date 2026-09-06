@@ -22,6 +22,10 @@ import inspect
 import pytest
 
 from backend.core.ouroboros.governance.op_context import GenerationResult
+from backend.core.ouroboros.governance.tool_executor import (
+    ToolExecStatus,
+    ToolExecutionRecord,
+)
 # Importing the runner registers the GENERATE/generate adapter at module load.
 import backend.core.ouroboros.governance.phase_runners.generate_runner as gr  # noqa: F401,E501
 from backend.core.ouroboros.governance.determinism.phase_capture import (
@@ -47,6 +51,18 @@ def _gen(n: int = 2) -> GenerationResult:
         is_noop=False,
         venom_edit_history=({"tool": "edit_file", "path": "f0.py"},),
         prompt_preloaded_files=("f0.py",),
+        tool_execution_records=(
+            ToolExecutionRecord(
+                schema_version="tool.exec.v1", op_id="op-gen-1",
+                call_id="op-gen-1:r0:read_file", round_index=0,
+                tool_name="read_file", tool_version="1",
+                arguments_hash="abc123", repo="jarvis",
+                policy_decision="ALLOW", policy_reason_code="ok",
+                started_at_ns=111, ended_at_ns=222, duration_ms=1.5,
+                output_bytes=42, error_class=None,
+                status=ToolExecStatus.SUCCESS,
+            ),
+        ),
         total_input_tokens=100,
         total_output_tokens=42,
         cost_usd=0.01,
@@ -96,9 +112,11 @@ def test_adapter_roundtrips_generation_result():
     assert back.total_output_tokens == g.total_output_tokens
     assert back.cost_usd == g.cost_usd
     assert back.venom_edit_history == g.venom_edit_history
-    # tool_execution_records are live-execution audit → empty on the
-    # reconstructed (replay) result, by design.
-    assert back.tool_execution_records == ()
+    # tool_execution_records ARE preserved across the round-trip now: the
+    # adapter runs in RECORD mode on the LIVE object (not only REPLAY), so
+    # dropping them silently zeroed the recap tool-count on every op.
+    assert len(back.tool_execution_records) == 1
+    assert back.tool_execution_records[0].tool_name == "read_file"
 
 
 def test_adapter_handles_none():
@@ -189,6 +207,55 @@ async def test_park_propagates_through_capture(det_env, monkeypatch):
             op_id="op-park-1", phase="GENERATE", kind="generate",
             ctx=_Ctx(), compute=compute_park,
         )
+
+
+# ── records survive the round-trip (the recap tool-count leak) ───────
+
+def test_adapter_preserves_tool_execution_records():
+    """The GENERATE adapter must carry tool_execution_records across the
+    serialize->deserialize round-trip it performs in RECORD mode, not only
+    REPLAY. The deserialize used to hardcode ``()`` so the terminal seam saw
+    0 tools for every op even though the model explored. Volatile wall-clock
+    timings are intentionally dropped so the stored form stays VERIFY-stable."""
+    a = get_adapter(phase="GENERATE", kind="generate")
+    g = _gen(1)
+    back = a.deserialize(a.serialize(g))
+    assert len(back.tool_execution_records) == 1
+    r0 = back.tool_execution_records[0]
+    o0 = g.tool_execution_records[0]
+    assert r0.tool_name == o0.tool_name
+    assert r0.arguments_hash == o0.arguments_hash
+    assert r0.output_bytes == o0.output_bytes
+    assert r0.round_index == o0.round_index
+    assert getattr(r0.status, "value", r0.status) == "success"
+    # Volatile timings dropped -> None (a fabricated timestamp would lie).
+    assert r0.started_at_ns is None
+    assert r0.ended_at_ns is None
+    assert r0.duration_ms is None
+
+
+@pytest.mark.asyncio
+async def test_record_mode_preserves_records_through_capture(
+    det_env, monkeypatch,
+):
+    """RECORD mode must return a result that still carries the live tool
+    records and token counts. This is the actual leak: capture_phase_decision
+    round-trips through the adapter in RECORD mode and the old deserialize
+    dropped the records, so ctx.generation reached the seam with 0 tools."""
+    monkeypatch.setenv("JARVIS_DETERMINISM_LEDGER_MODE", "record")
+    reset_all_for_tests()
+
+    async def compute_live():
+        return _gen(1)
+
+    out = await capture_phase_decision(
+        op_id="op-gen-rec", phase="GENERATE", kind="generate",
+        ctx=_Ctx(), compute=compute_live,
+    )
+    assert isinstance(out, GenerationResult)
+    assert len(out.tool_execution_records) == 1
+    assert out.tool_execution_records[0].tool_name == "read_file"
+    assert out.total_output_tokens == 42
 
 
 # ── reachability: the wire is present, digest-only capture is gone ───

@@ -6671,6 +6671,27 @@ class PrimeProvider:
         _prime_final = result.with_tool_records(
             tool_records
         ).with_venom_edits(venom_edits)
+        # Bind the token counts onto the returned result. The parse helper
+        # leaves total_output_tokens=0 (it never sees the response usage);
+        # the provider computed the split above for its log line, so the
+        # recap's output-token count read generation.total_output_tokens as
+        # 0 on the whole local lane. DRY: reuse `_prime_meta`, the SAME usage
+        # dict the log line + trajectory recorder already read -- no second
+        # source of truth. NEVER breaks generation on a telemetry fault.
+        try:
+            _pf_out = int(_prime_meta.get(
+                "completion_tokens",
+                getattr(response, "tokens_used", 0) if response else 0,
+            ) or 0)
+            _pf_in = int(_prime_meta.get("prompt_tokens", 0) or 0)
+            if _pf_out or _pf_in:
+                _prime_final = dataclasses.replace(
+                    _prime_final,
+                    total_output_tokens=_pf_out,
+                    total_input_tokens=_pf_in,
+                )
+        except Exception:  # noqa: BLE001 -- telemetry must never break gen
+            pass
         # Trajectory recorder — the LOCAL lane's generation half.
         #
         # This seam is separate from ClaudeProvider's

@@ -146,6 +146,72 @@ def _register_generate_adapter() -> None:
             GenerationResult,
         )
 
+        def _tool_rec_to_dict(rec: Any) -> Dict[str, Any]:
+            """JSON-safe projection of a ToolExecutionRecord for the
+            determinism ledger. The volatile wall-clock timings
+            (started_at_ns / ended_at_ns / duration_ms) are DROPPED so the
+            stored + hashed form is stable across runs (VERIFY-safe); every
+            field the recap tool-count and the Iron Gate diversity scorer
+            read -- tool_name, status, arguments_hash, output_bytes,
+            round_index, identity -- is preserved. NEVER raises."""
+            _st = getattr(rec, "status", None)
+            return {
+                "schema_version": str(getattr(rec, "schema_version", "") or ""),
+                "op_id": str(getattr(rec, "op_id", "") or ""),
+                "call_id": str(getattr(rec, "call_id", "") or ""),
+                "round_index": int(getattr(rec, "round_index", 0) or 0),
+                "tool_name": str(getattr(rec, "tool_name", "") or ""),
+                "tool_version": str(getattr(rec, "tool_version", "") or ""),
+                "arguments_hash": str(getattr(rec, "arguments_hash", "") or ""),
+                "repo": str(getattr(rec, "repo", "") or ""),
+                "policy_decision": str(getattr(rec, "policy_decision", "") or ""),
+                "policy_reason_code": str(
+                    getattr(rec, "policy_reason_code", "") or ""),
+                "output_bytes": int(getattr(rec, "output_bytes", 0) or 0),
+                "error_class": (
+                    str(getattr(rec, "error_class", None))
+                    if getattr(rec, "error_class", None) else None
+                ),
+                "status": (
+                    getattr(_st, "value", None)
+                    or (str(_st) if _st is not None else None)
+                ),
+            }
+
+        def _tool_rec_from_dict(d: Any) -> Any:
+            """Rebuild a ToolExecutionRecord from _tool_rec_to_dict's
+            projection. Dropped timings rehydrate as None -- no consumer
+            reads them and a fabricated timestamp would be a lie. An unknown
+            status falls back to None (the diversity scorer treats None as
+            succeeded). NEVER raises beyond a bad-shape guard."""
+            from backend.core.ouroboros.governance.tool_executor import (
+                ToolExecStatus,
+                ToolExecutionRecord,
+            )
+            _raw = d.get("status") if isinstance(d, dict) else None
+            try:
+                _st = ToolExecStatus(_raw) if _raw is not None else None
+            except Exception:  # noqa: BLE001
+                _st = getattr(ToolExecStatus, str(_raw), None)
+            return ToolExecutionRecord(
+                schema_version=str(d.get("schema_version", "") or ""),
+                op_id=str(d.get("op_id", "") or ""),
+                call_id=str(d.get("call_id", "") or ""),
+                round_index=int(d.get("round_index", 0) or 0),
+                tool_name=str(d.get("tool_name", "") or ""),
+                tool_version=str(d.get("tool_version", "") or ""),
+                arguments_hash=str(d.get("arguments_hash", "") or ""),
+                repo=str(d.get("repo", "") or ""),
+                policy_decision=str(d.get("policy_decision", "") or ""),
+                policy_reason_code=str(d.get("policy_reason_code", "") or ""),
+                started_at_ns=None,
+                ended_at_ns=None,
+                duration_ms=None,
+                output_bytes=int(d.get("output_bytes", 0) or 0),
+                error_class=(d.get("error_class") or None),
+                status=_st,
+            )
+
         def _serialize(gen: Any) -> Any:
             if gen is None:
                 return {"__none__": True}
@@ -159,6 +225,10 @@ def _register_generate_adapter() -> None:
                 ),
                 "model_id": str(getattr(gen, "model_id", "") or ""),
                 "is_noop": bool(getattr(gen, "is_noop", False)),
+                "tool_execution_records": [
+                    _tool_rec_to_dict(r)
+                    for r in (getattr(gen, "tool_execution_records", ()) or ())
+                ],
                 "venom_edit_history": [
                     dict(e)
                     for e in (getattr(gen, "venom_edit_history", ()) or ())
@@ -189,7 +259,14 @@ def _register_generate_adapter() -> None:
                 ),
                 model_id=str(stored.get("model_id", "")),
                 is_noop=bool(stored.get("is_noop", False)),
-                tool_execution_records=(),  # no tools run in a replay
+                # Records ARE preserved across the round-trip (this adapter
+                # runs in RECORD mode on the LIVE object, not only in REPLAY):
+                # a determinism-stable projection was serialized above, so the
+                # recap tool-count + Iron Gate exploration credit survive.
+                tool_execution_records=tuple(
+                    _tool_rec_from_dict(d)
+                    for d in (stored.get("tool_execution_records") or [])
+                ),
                 venom_edit_history=tuple(
                     dict(e) for e in (stored.get("venom_edit_history") or [])
                 ),

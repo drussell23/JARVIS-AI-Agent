@@ -11771,18 +11771,69 @@ class GovernedOrchestrator:
                         )
                 elif _commit_result.skipped_reason:
                     _commit_skip_reason = _commit_result.skipped_reason
-                    logger.debug(
-                        "[Orchestrator] Auto-commit skipped: %s",
-                        _commit_result.skipped_reason,
-                    )
+                    # A skip that is actually a git-STATE fault (the committer
+                    # reports a lock / conflict / rejection as a skip rather than
+                    # raising) gets the same Phase 2 recovery as an exception; a
+                    # DELIBERATE skip (protected branch, no changes, gitignore
+                    # breach) classifies as "other" and is left exactly as before.
+                    try:
+                        from backend.core.ouroboros.governance.commit_fault_recovery import (  # noqa: E501
+                            classify_commit_fault,
+                            recover_from_commit_fault,
+                        )
+                        _skip_fault = classify_commit_fault(
+                            Exception(str(_commit_result.skipped_reason)),
+                        )
+                        if _skip_fault != "other":
+                            _recovery = await recover_from_commit_fault(
+                                self, ctx,
+                                Exception(str(_commit_result.skipped_reason)),
+                            )
+                            _commit_skip_reason = f"commit_fault:{_skip_fault}"
+                            await self._record_ledger(
+                                ctx, OperationState.APPLYING,
+                                {"event": "commit_fault_recovered", **_recovery},
+                            )
+                        else:
+                            logger.debug(
+                                "[Orchestrator] Auto-commit skipped: %s",
+                                _commit_result.skipped_reason,
+                            )
+                    except Exception:  # noqa: BLE001 — recovery never breaks APPLY
+                        logger.debug(
+                            "[Orchestrator] Auto-commit skipped: %s",
+                            _commit_result.skipped_reason,
+                        )
             except ImportError:
                 logger.debug("[Orchestrator] AutoCommitter not available")
             except Exception as exc:
-                logger.warning(
-                    "[Orchestrator] Auto-commit failed for op=%s: %s; "
-                    "change is applied but not committed",
-                    ctx.op_id, exc,
-                )
+                # ---- Phase 2: commit-stage fault recovery ----
+                # A locked index, merge conflict, or diff rejection (or a commit
+                # timeout) leaves a VERIFIED change contesting the working tree.
+                # Rather than log-and-leave it dangling: stash the change (scoped
+                # to this op's files, recoverable — never a destructive reset),
+                # emit a non-blocking diff_rejection event, and route the precise
+                # fault to the PLAN subagent for a SURGICAL re-plan — all without
+                # stalling the daemon. Fail-soft: recovery NEVER escalates a
+                # non-fatal commit miss into a crashed op.
+                try:
+                    from backend.core.ouroboros.governance.commit_fault_recovery import (  # noqa: E501
+                        recover_from_commit_fault,
+                    )
+                    _recovery = await recover_from_commit_fault(self, ctx, exc)
+                    _commit_skip_reason = (
+                        f"commit_fault:{_recovery.get('fault', 'other')}"
+                    )
+                    await self._record_ledger(
+                        ctx, OperationState.APPLYING,
+                        {"event": "commit_fault_recovered", **_recovery},
+                    )
+                except Exception:  # noqa: BLE001 — recovery must never break APPLY
+                    logger.warning(
+                        "[Orchestrator] Auto-commit failed for op=%s: %s; change "
+                        "is applied but not committed (recovery degraded)",
+                        ctx.op_id, exc,
+                    )
 
             # ---- Phase 8b-p: Workspace promotion (Slice 11) ----
             # Inline twin of the Slice4bRunner hook (T5 lesson: BOTH paths).

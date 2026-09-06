@@ -727,6 +727,49 @@ def _write_notebook_fault(session_dir: Any, exc: BaseException) -> bool:
     except Exception:  # noqa: BLE001
         return False
 
+
+def _slug_from_desc(desc: str) -> str:
+    """A stable, filesystem-safe goal id from a description when the
+    operator gives none — lowercased words joined by hyphens, bounded. The
+    id only has to be unique in the roadmap; the signature is the authority."""
+    import re as _r
+    words = _r.findall(r"[a-z0-9]+", (desc or "").lower())
+    slug = "-".join(words[:6]) or "goal"
+    return f"op-{slug}"[:64]
+
+
+def _roadmap_goal(goal_id: str):
+    """The verified RoadmapGoal for ``goal_id``, or None. Reads through the
+    same reader the cage consults, so the cockpit and the cage agree on what
+    a goal's scope IS. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance import roadmap_reader as _rr
+        _verdict, doc, _diag = _rr.read_roadmap()
+        if doc is None:
+            return None
+        gid = str(goal_id or "").strip()
+        for g in getattr(doc, "goals", ()) or ():
+            if str(getattr(g, "goal_id", "")).strip() == gid:
+                return g
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _goal_scope_from_roadmap(goal_id: str):
+    """A signed goal's declared ``target_files`` tuple, or (). NEVER raises."""
+    g = _roadmap_goal(goal_id)
+    return tuple(getattr(g, "target_files", ()) or ()) if g is not None else ()
+
+
+def _goal_desc_from_roadmap(goal_id: str) -> str:
+    """A signed goal's description (the model's task), or \"\". NEVER raises."""
+    g = _roadmap_goal(goal_id)
+    if g is None:
+        return ""
+    return str(getattr(g, "description", "") or getattr(g, "title", "") or "")
+
+
 class BattleTestHarness:
     """Orchestrates the full Ouroboros boot, event-driven session loop, and shutdown.
 
@@ -5625,41 +5668,6 @@ class BattleTestHarness:
             from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: E501
                 make_envelope,
             )
-            from backend.core.ouroboros.governance.intake.unified_intake_router import (  # noqa: E501
-                get_default_intake_router,
-            )
-
-            gls = getattr(self, "_governed_loop_service", None)
-            router = None
-            for _attr in ("_intake_router", "intake_router", "_router"):
-                router = getattr(gls, _attr, None)
-                if router is not None:
-                    break
-            if router is None:
-                # The process-wide singleton the router registers on its own
-                # construction — the same handle the voice side uses. Without
-                # this, a deployment that never attached the router to the GLS
-                # files every typed goal while a live router sits one import
-                # away.
-                router = get_default_intake_router()
-            if router is None:
-                logger.warning(
-                    "[OperatorGoal] no intake router reachable — goal will "
-                    "be FILED, not run",
-                )
-                return None
-            submit = (
-                getattr(router, "submit_envelope", None)
-                or getattr(router, "ingest", None)
-                or getattr(router, "emit", None)
-            )
-            if submit is None:
-                logger.warning(
-                    "[OperatorGoal] router %s exposes no submit seam — goal "
-                    "will be FILED, not run", type(router).__name__,
-                )
-                return None
-
             # causal_id == signal_id: the keystroke IS the origin event,
             # exactly as VoiceCommandSensor treats the utterance ("vox").
             origin_id = generate_operation_id("chat")
@@ -5696,15 +5704,64 @@ class BattleTestHarness:
                 signal_id=origin_id,
             )
 
+            return self._dispatch_intake_envelope(envelope, origin_id)
+        except Exception:  # noqa: BLE001
+            # WARNING, not DEBUG. This is the operator's primary input path;
+            # when it dies the goal silently degrades to a backlog file, and
+            # a failure nobody can see is how this one survived twelve days.
+            logger.warning(
+                "[OperatorGoal] immediate dispatch failed (op=%s) — goal "
+                "will be FILED, not run", origin_id or "?", exc_info=True,
+            )
+            return None
+
+    def _dispatch_intake_envelope(
+        self, envelope: Any, origin_id: str,
+    ) -> Optional[str]:
+        """Resolve the shared intake router and submit a PRE-BUILT envelope,
+        returning an honest receipt. The ONE dispatch seam for operator-origin
+        work: a typed chat goal AND a sanctioned /goal both reach intake
+        through here, so one set of router-resolution, cross-thread and
+        receipt rules governs both. Returns None (the caller FILES + says so)
+        on any unreachable-intake condition. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.intake.unified_intake_router import (  # noqa: E501
+                get_default_intake_router,
+            )
+            gls = getattr(self, "_governed_loop_service", None)
+            router = None
+            for _attr in ("_intake_router", "intake_router", "_router"):
+                router = getattr(gls, _attr, None)
+                if router is not None:
+                    break
+            if router is None:
+                # The process-wide singleton the router registers on its own
+                # construction — the same handle the voice side uses.
+                router = get_default_intake_router()
+            if router is None:
+                logger.warning(
+                    "[OperatorGoal] no intake router reachable — goal will "
+                    "be FILED, not run",
+                )
+                return None
+            submit = (
+                getattr(router, "submit_envelope", None)
+                or getattr(router, "ingest", None)
+                or getattr(router, "emit", None)
+            )
+            if submit is None:
+                logger.warning(
+                    "[OperatorGoal] router %s exposes no submit seam — goal "
+                    "will be FILED, not run", type(router).__name__,
+                )
+                return None
             # Record it BEFORE dispatch resolves: Esc must be able to target
-            # an op the moment the operator sees "dispatched", not after
-            # intake finishes accepting it.
+            # an op the moment the operator sees "dispatched".
             try:
                 if hasattr(gls, "note_operator_op"):
                     gls.note_operator_op(origin_id)
             except Exception:  # noqa: BLE001
                 pass
-
             result = submit(envelope)
             if asyncio.iscoroutine(result):
                 try:
@@ -5713,8 +5770,6 @@ class BattleTestHarness:
                     running = None          # the normal case: a to_thread worker
                 loop = getattr(self, "_operator_goal_loop", None) or running
                 if loop is None:
-                    # Close the coroutine explicitly — an un-awaited coroutine
-                    # leaks and warns, and the goal must fall back cleanly.
                     result.close()
                     logger.warning(
                         "[OperatorGoal] no loop to dispatch on — goal will be "
@@ -5722,18 +5777,6 @@ class BattleTestHarness:
                     )
                     return None
                 if running is not None and running is loop:
-                    # ON the loop the coroutine must run on. Blocking here
-                    # would wedge the whole event loop for the timeout and
-                    # then fail anyway — the caller is the only thing that
-                    # could drive the coroutine it is waiting for.
-                    #
-                    # Production never lands here (`chat_text_bridge._run`
-                    # dispatches this executor through `asyncio.to_thread`),
-                    # but "never" was also true of the envelope contract this
-                    # function got wrong, so it is enforced rather than
-                    # assumed. File the goal instead of deadlocking, and say
-                    # so loudly — a caller on the wrong thread is a wiring
-                    # bug, not a runtime condition to absorb silently.
                     result.close()
                     logger.warning(
                         "[OperatorGoal] submitter called ON the event loop "
@@ -5746,14 +5789,10 @@ class BattleTestHarness:
                 )
             else:
                 verdict = result
-
             return self._operator_goal_receipt(
                 verdict, origin_id, router=router, envelope=envelope,
             )
         except Exception:  # noqa: BLE001
-            # WARNING, not DEBUG. This is the operator's primary input path;
-            # when it dies the goal silently degrades to a backlog file, and
-            # a failure nobody can see is how this one survived twelve days.
             logger.warning(
                 "[OperatorGoal] immediate dispatch failed (op=%s) — goal "
                 "will be FILED, not run", origin_id or "?", exc_info=True,
@@ -6572,14 +6611,207 @@ class BattleTestHarness:
         elif subcmd == "explain":
             self._repl_print(f"[{_SEM['death']}]Usage: /goal explain <op-id>[/]")
 
+        elif subcmd == "sanction":
+            self._repl_goal_sanction(parts[2] if len(parts) > 2 else "")
+
+        elif subcmd == "inject":
+            self._repl_goal_inject(parts[2] if len(parts) > 2 else "")
+
         else:
             self._repl_print(
                 "[dim]Usage: /goal | /goal all | /goal tree | "
                 "/goal show <id> | /goal add [--parent <id>] <desc> | "
                 "/goal remove <id> | /goal pause|resume|complete <id> | "
                 "/goal purge | /goal activity [--goal <id>] [--limit N] | "
-                "/goal drift | /goal explain <op-id>[/dim]"
+                "/goal drift | /goal explain <op-id> | "
+                "/goal sanction <desc> --files <f...> [--symbol <s...>] | "
+                "/goal inject <goal-id>[/dim]"
             )
+
+    # -- /goal sanction|inject — the operator's cage-authorized work lane -
+
+    @staticmethod
+    def _parse_goal_flags(argstr: str):
+        """Split a ``/goal sanction`` / ``/goal inject`` argument string into
+        ``{files, symbols, id, success, note, desc}`` plus the resolved
+        description.
+
+        The description is the LEADING free text (everything before the first
+        ``--flag``) or an explicit ``--desc``. A multi-flag (``--files``) then
+        greedily collects tokens until the next ``--flag``; a single-flag
+        (``--id``) takes one. Leading-description is the one unambiguous rule:
+        a description placed AFTER ``--files`` is indistinguishable from more
+        file paths, so the grammar refuses that shape rather than guessing.
+        Nothing is hardcoded beyond these flag maps. NEVER raises."""
+        import shlex
+        try:
+            tokens = shlex.split(argstr or "")
+        except ValueError:
+            tokens = (argstr or "").split()
+        multi = {"--files": "files", "--file": "files",
+                 "--symbol": "symbols", "--symbols": "symbols"}
+        single = {"--id": "id", "--success": "success", "--note": "note",
+                  "--desc": "desc", "--description": "desc"}
+        out = {"files": [], "symbols": [], "id": "", "success": "",
+               "note": "", "desc": ""}
+        i, n = 0, len(tokens)
+        lead = []
+        # Leading description: everything up to the first recognized/unknown flag.
+        while i < n and not tokens[i].startswith("--"):
+            lead.append(tokens[i]); i += 1
+        while i < n:
+            t = tokens[i]
+            if t in multi:
+                i += 1
+                while i < n and not tokens[i].startswith("--"):
+                    out[multi[t]].append(tokens[i]); i += 1
+            elif t in single:
+                i += 1
+                if i < n and not tokens[i].startswith("--"):
+                    out[single[t]] = tokens[i]; i += 1
+            elif t.startswith("--"):
+                i += 1  # unknown flag — skip, never guess
+            else:
+                # A stray non-flag token after a single-flag → description
+                # best-effort, never silently a file path.
+                lead.append(t); i += 1
+        return out, (out["desc"] or " ".join(lead))
+
+    def _repl_goal_sanction(self, argstr: str) -> None:
+        """``/goal sanction <description> --files <f...> [--symbol <s...>]
+        [--id <id>] [--success <text>] [--note <text>]``
+
+        Author + sign a file-scoped goal into the operator roadmap the cage
+        verifies, then inject it as one scoped op through the SAME intake
+        every sensor uses. Signing is gated by
+        ``JARVIS_COCKPIT_GOAL_SIGNING_ENABLED``; when off, sanction
+        out-of-band with ``scripts/sanction_goal.py`` and use ``/goal
+        inject <id>``. NEVER raises into the REPL."""
+        try:
+            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                operator_goal_sanction as ogs,
+            )
+            flags, desc = self._parse_goal_flags(argstr)
+            files = tuple(flags["files"])
+            if not files:
+                self._repl_print(
+                    f"[{_SEM['death']}]Usage: /goal sanction <description> "
+                    f"--files <path...> [--symbol <name...>][/]")
+                return
+            if not desc.strip():
+                self._repl_print(
+                    f"[{_SEM['death']}]a sanctioned goal needs a description "
+                    f"— it is the task the model is given[/]")
+                return
+            if not ogs.cockpit_signing_enabled():
+                self._repl_print(
+                    f"[{_SEM['heal']}]in-cockpit signing is OFF "
+                    f"(JARVIS_COCKPIT_GOAL_SIGNING_ENABLED=false). Sign with "
+                    f"scripts/sanction_goal.py, then /goal inject <id>[/]")
+                return
+            targets = ogs.normalize_target_files(files)
+            gid = flags["id"].strip() or _slug_from_desc(desc)
+            spec = ogs.GoalSpec(
+                goal_id=gid, title=desc[:120], description=desc,
+                target_files=targets,
+                target_symbols=tuple(flags["symbols"]),
+                success_criteria=flags["success"], note=flags["note"],
+            )
+            res = ogs.author_and_sign_goal(spec)
+            if not res.ok:
+                self._repl_print(
+                    f"[{_SEM['death']}]sanction refused: {res.reason} "
+                    f"— {res.detail}[/]")
+                return
+            self._repl_print(
+                f"[{_SEM['success']}]sanctioned[/] "
+                f"[{_SEM['neural']}]{res.goal_id}[/] over {len(targets)} file(s)")
+            self._inject_and_report(res.goal_id, desc, targets)
+        except Exception:  # noqa: BLE001
+            logger.warning("[OperatorGoal] /goal sanction failed", exc_info=True)
+            self._repl_print(f"[{_SEM['death']}]sanction failed — see logs[/]")
+
+    def _repl_goal_inject(self, argstr: str) -> None:
+        """``/goal inject <goal-id> [--files <f...>]`` — inject a PRE-signed
+        roadmap goal as one scoped op. The files default to the goal's own
+        declared scope in the signed roadmap, so the common case is just the
+        id. Fail-closed: an unknown/expired/out-of-scope goal is refused in
+        the cockpit, never dispatched. NEVER raises into the REPL."""
+        try:
+            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                operator_goal_sanction as ogs,
+            )
+            flags, rest = self._parse_goal_flags(argstr)
+            gid = (flags["id"] or rest).strip().split()[0] if (flags["id"] or rest).strip() else ""
+            if not gid:
+                self._repl_print(
+                    f"[{_SEM['death']}]Usage: /goal inject <goal-id> "
+                    f"[--files <path...>][/]")
+                return
+            files = tuple(flags["files"]) or _goal_scope_from_roadmap(gid)
+            if not files:
+                self._repl_print(
+                    f"[{_SEM['death']}]goal '{gid}' has no declared scope in the "
+                    f"signed roadmap — pass --files, or /goal sanction it[/]")
+                return
+            desc = _goal_desc_from_roadmap(gid) or f"execute sanctioned goal {gid}"
+            self._inject_and_report(gid, desc, ogs.normalize_target_files(files))
+        except Exception:  # noqa: BLE001
+            logger.warning("[OperatorGoal] /goal inject failed", exc_info=True)
+            self._repl_print(f"[{_SEM['death']}]inject failed — see logs[/]")
+
+    def _inject_and_report(self, goal_id: str, description: str,
+                           target_files) -> None:
+        """Build the scoped envelope and dispatch it through the shared
+        intake router, printing an honest receipt. NEVER raises."""
+        op_id = self._inject_sanctioned_goal(
+            goal_id=goal_id, description=description, target_files=target_files,
+        )
+        if op_id:
+            self._repl_print(
+                f"[{_SEM['success']}]dispatched[/] [dim]op={op_id} "
+                f"scope={len(tuple(target_files))} file(s) · APPROVAL_REQUIRED "
+                f"ceiling (a verified goal never auto-applies)[/dim]")
+        else:
+            self._repl_print(
+                f"[{_SEM['death']}]not dispatched — the cage refused the claim "
+                f"(unsigned / expired / out-of-scope) or intake was "
+                f"unreachable; see logs[/]")
+
+    def _inject_sanctioned_goal(self, *, goal_id: str, description: str,
+                                target_files) -> Optional[str]:
+        """Inject a signed, file-scoped goal as ONE scoped op through the
+        shared intake router. The envelope carries ``source=\"roadmap\"`` +
+        the provenance claim, so classify re-derives the operator's delegated
+        authority from the signed roadmap and the op flows the SAME
+        classify → route → GENERATE → Iron Gate → GATE → VERIFY pipeline as
+        every signal — no manual-goal fast path. Returns the op id, or None.
+        NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.operator_goal_sanction import (  # noqa: E501,PLC0415
+                build_scoped_envelope,
+            )
+            from backend.core.ouroboros.governance.operation_id import (  # noqa: E501,PLC0415
+                generate_operation_id,
+            )
+            envelope = build_scoped_envelope(
+                goal_id=goal_id, description=description,
+                target_files=tuple(target_files),
+            )
+            if envelope is None:
+                return None
+            origin_id = generate_operation_id("goal")
+            try:
+                gls = getattr(self, "_governed_loop_service", None)
+                if gls is not None and hasattr(gls, "note_operator_op"):
+                    gls.note_operator_op(origin_id)
+            except Exception:  # noqa: BLE001
+                pass
+            return self._dispatch_intake_envelope(envelope, origin_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[OperatorGoal] sanctioned inject failed", exc_info=True)
+            return None
 
     # -- /goal activity|drift|explain helpers (Increment 3) -------------
 

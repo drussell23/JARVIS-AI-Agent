@@ -187,9 +187,17 @@ def test_the_submitter_uses_the_router_every_sensor_uses() -> None:
 
     from backend.core.ouroboros.battle_test.harness import BattleTestHarness
 
-    src = inspect.getsource(BattleTestHarness._submit_operator_goal)
-    assert '"_intake_router", "intake_router", "_router"' in src
-    assert 'source="operator_chat"' in src
+    # The router resolution moved into the shared _dispatch_intake_envelope
+    # seam (a typed chat goal AND a sanctioned /goal both reach intake through
+    # it), so the submitter delegates rather than inlining the lane — the DRY
+    # property this test guards, now stronger.
+    submit_src = inspect.getsource(BattleTestHarness._submit_operator_goal)
+    assert "self._dispatch_intake_envelope(" in submit_src
+    assert 'source="operator_chat"' in submit_src
+    dispatch_src = inspect.getsource(
+        BattleTestHarness._dispatch_intake_envelope,
+    )
+    assert '"_intake_router", "intake_router", "_router"' in dispatch_src
 
 
 def test_urgency_is_high_not_critical() -> None:

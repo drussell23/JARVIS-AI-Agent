@@ -157,3 +157,78 @@ def test_envelope_none_when_goal_absent(sanction_env):
 def test_normalize_target_files_dedupes_and_relativizes():
     out = ogs.normalize_target_files(["a/b.py", "a/b.py", "./c.py", ""])
     assert out == ("a/b.py", "./c.py")
+
+
+# ── cockpit /goal verb wiring (parser + roadmap read-back + shared dispatch) ─
+
+
+class TestGoalVerbWiring:
+    def test_flag_parser_multi_single_and_trailing_description(self):
+        from backend.core.ouroboros.battle_test.harness import BattleTestHarness
+        flags, desc = BattleTestHarness._parse_goal_flags(
+            '--files a.py b.py --symbol foo bar --id my-goal '
+            '--success "done when green" fix the thing'
+        )
+        assert flags["files"] == ["a.py", "b.py"]
+        assert flags["symbols"] == ["foo", "bar"]
+        assert flags["id"] == "my-goal"
+        assert flags["success"] == "done when green"
+        assert desc == "fix the thing"
+
+    def test_flag_parser_leading_description(self):
+        from backend.core.ouroboros.battle_test.harness import BattleTestHarness
+        # The natural shape: description FIRST, flags after. Unambiguous — a
+        # description after --files would be indistinguishable from more paths.
+        flags, desc = BattleTestHarness._parse_goal_flags(
+            "fix the recap bug --files a.py --symbol compose_recap"
+        )
+        assert desc == "fix the recap bug"
+        assert flags["files"] == ["a.py"]
+        assert flags["symbols"] == ["compose_recap"]
+
+    def test_flag_parser_unknown_flag_is_skipped_not_guessed(self):
+        from backend.core.ouroboros.battle_test.harness import BattleTestHarness
+        flags, desc = BattleTestHarness._parse_goal_flags(
+            "just do it --bogus --files a.py"
+        )
+        assert flags["files"] == ["a.py"]
+        assert desc == "just do it"
+
+    def test_slug_from_desc_is_stable_and_bounded(self):
+        from backend.core.ouroboros.battle_test.harness import _slug_from_desc
+        assert _slug_from_desc("Fix the Recap Timer!!").startswith(
+            "op-fix-the-recap"
+        )
+        assert _slug_from_desc("") == "op-goal"
+        assert len(_slug_from_desc("x " * 200)) <= 64
+
+    def test_roadmap_readback_helpers(self, sanction_env):
+        from backend.core.ouroboros.battle_test.harness import (
+            _goal_desc_from_roadmap,
+            _goal_scope_from_roadmap,
+        )
+        res = ogs.author_and_sign_goal(
+            ogs.GoalSpec(
+                goal_id="scope-goal", title="t",
+                description="do the scoped thing",
+                target_files=("backend/x.py", "backend/y.py"),
+            ),
+            path_override=sanction_env,
+        )
+        assert res.ok
+        assert set(_goal_scope_from_roadmap("scope-goal")) == {
+            "backend/x.py", "backend/y.py",
+        }
+        assert _goal_desc_from_roadmap("scope-goal") == "do the scoped thing"
+        # a goal that was never signed reads back as empty scope, never a guess
+        assert _goal_scope_from_roadmap("nope") == ()
+
+    def test_injection_uses_the_shared_dispatch_seam(self):
+        # DRY: the sanctioned-goal lane and the typed-chat lane BOTH reach
+        # intake through _dispatch_intake_envelope — no private manual-goal path.
+        import inspect
+
+        from backend.core.ouroboros.battle_test.harness import BattleTestHarness
+        src = inspect.getsource(BattleTestHarness._inject_sanctioned_goal)
+        assert "self._dispatch_intake_envelope(" in src
+        assert "build_scoped_envelope(" in src

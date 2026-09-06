@@ -481,12 +481,31 @@ def flock_append_lines(
                 return False
             try:
                 with target.open("a", encoding="utf-8") as fh:
+                    # HEAL A TORN TAIL BEFORE APPENDING.
+                    #
+                    # A killed process can leave a line whose payload
+                    # landed and whose terminator did not — the recorder's
+                    # rows reach 24 KB, far past any size a single write is
+                    # atomic at. Appending onto that tail CONCATENATES the
+                    # next row into it, so one interruption destroys TWO
+                    # rows: the torn one and the good one that follows.
+                    # Demonstrated: 3 rows written, 2 lines on disk, 1
+                    # parseable.
+                    #
+                    # Terminating the tail turns that into one lost row,
+                    # which the reader already counts and tolerates. It
+                    # happens under the same flock as the append, so no
+                    # other writer can be mid-line while we look, and the
+                    # seek is one read of at most one byte.
+                    _terminate_partial_tail(fh, target)
                     for raw_line in lines:
                         if not isinstance(raw_line, str):
                             # Coerce defensively rather than raise.
                             raw_line = str(raw_line)
-                        fh.write(raw_line)
-                        fh.write("\n")
+                        # ONE write, so there is no window in which the
+                        # payload is on its way to the file and its
+                        # terminator is not yet queued behind it.
+                        fh.write(raw_line + "\n")
                     fh.flush()
                 return True
             except OSError as exc:
@@ -617,6 +636,47 @@ async def async_flock_critical_section(
 # DecisionTraceLedger.record -> flock_append_line. These helpers route
 # the whole lock-wait+write through cooperative_fs_io.offload so the
 # poll loop runs on the F8 thread pool instead.
+
+
+def _terminate_partial_tail(fh, target: Path) -> bool:
+    """Give the file a trailing newline if it lacks one. NEVER raises.
+
+    Called with the append handle open and the flock HELD, so the file
+    cannot change underneath the check. Returns True if a terminator was
+    written, which the caller does not need but a test does.
+
+    Reads exactly one byte. The handle is opened in append mode, so the
+    write below lands at the end regardless of where this seek leaves the
+    read position — append-mode writes always go to the end on POSIX, and
+    a separate read handle keeps the two positions from interacting at
+    all.
+
+    An empty or absent file needs nothing: there is no partial line to
+    terminate, and writing a newline into an empty file would create a
+    blank first line for every fresh log.
+    """
+    try:
+        size = target.stat().st_size
+        if size <= 0:
+            return False
+        with target.open("rb") as probe:
+            probe.seek(-1, os.SEEK_END)
+            if probe.read(1) == b"\n":
+                return False
+        fh.write("\n")
+        logger.warning(
+            "[CrossProcessJSONL] %s ended mid-line; terminated it before "
+            "appending. One row was lost to an interrupted write — the "
+            "rows around it are intact.", target,
+        )
+        return True
+    except OSError as exc:
+        # Fail OPEN. Refusing to append because the tail could not be
+        # inspected would turn a recoverable torn line into total data
+        # loss for everything after it.
+        logger.debug("[CrossProcessJSONL] tail probe failed at %s: %s",
+                     target, exc)
+        return False
 
 
 def _append_lines_with_mkdir(

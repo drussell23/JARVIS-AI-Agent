@@ -687,6 +687,54 @@ def _detail_prefix() -> str:
         return "  ⎿  "
 
 
+def _shell_command_line_enabled() -> bool:
+    """Whether a bash tool block shows the command it ran on its own
+    ``$ <command>`` line (Claude Code's shell idiom). Default ON;
+    ``JARVIS_SHELL_COMMAND_LINE_ENABLED=false`` drops it. NEVER raises."""
+    import os
+    return os.environ.get(
+        "JARVIS_SHELL_COMMAND_LINE_ENABLED", "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _shell_command_max_chars() -> int:
+    """Longest command shown on the ``$`` line before it is clipped — a
+    heredoc-sized command is one call, not a document. Env-tunable."""
+    import os
+    try:
+        return max(24, int(os.environ.get("JARVIS_SHELL_COMMAND_MAX_CHARS", "160")))
+    except (TypeError, ValueError):
+        return 160
+
+
+def _bash_command_line(args_str: str, palette: "Optional[Mapping[str, str]]",
+                       indent: str) -> "Optional[str]":
+    """The ``$ <command>`` body line for a bash call — the command it ran,
+    ANSI-sanitized (a program that echoes its own escape codes can never
+    corrupt the deck) and clipped. ``None`` when there is nothing to show.
+    NEVER raises."""
+    try:
+        if not _shell_command_line_enabled():
+            return None
+        from backend.core.ouroboros.battle_test.live_tool_stream import (
+            sanitize_stream_text,
+        )
+        cmd = sanitize_stream_text(args_str).strip()
+        if not cmd:
+            return None
+        cmd = " ".join(cmd.split())  # collapse the newlines of a heredoc
+        limit = _shell_command_max_chars()
+        if len(cmd) > limit:
+            cmd = cmd[: limit - 1].rstrip() + "…"
+        # A command is dim — the same footing the composer's arg-kind map
+        # gives a command elsewhere ("command" -> dim), so the `$` line reads
+        # as chrome around the literal, not as output.
+        colour = _palette_value(palette, "dim")
+        return f"{indent}[{colour}]$ {_escape(cmd)}[/{colour}]"
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _body_indent() -> str:
     """Leading spaces that put a body line under the summary's text.
 
@@ -926,6 +974,16 @@ def compose(
         )
         for ln in rendered.body_lines
     )
+
+    # SHELL VISIBILITY — for a bash call, show the command it ran on its own
+    # ``$ <command>`` line, Claude Code's shell idiom: the header carries the
+    # short form and the natural-language "why" rides the 🗣 preamble, so this
+    # is the literal command the operator can read and trust. Additive — a
+    # non-bash tool is byte-identical. NEVER raises.
+    if str(tool_name or "").strip().lower() == "bash":
+        _cmd_line = _bash_command_line(str(args_str or ""), palette, _body_indent())
+        if _cmd_line:
+            body_lines_markup = (_cmd_line,) + body_lines_markup
 
     # §37 Tier 2 #13 Slice 5 (2026-05-07) — composer pulls the
     # last-observed confidence band for this (op_id, tool_name)

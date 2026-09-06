@@ -426,8 +426,12 @@ def test_compose_escapes_brackets_in_body_lines():
         explicit_density=_density(max_body_lines=10),
         store=store,
     )
-    # No raw `[suspicious markup]` should appear unescaped.
-    assert "\\[suspicious markup]" in out.body_lines_markup[0]
+    # No raw `[suspicious markup]` appears unescaped; the bash `$ ls`
+    # command line now leads the body, so the escaped result follows it.
+    esc = "\\[suspicious markup]"
+    assert any(esc in ln for ln in out.body_lines_markup)
+    assert not any(("[suspicious markup]" in ln and esc not in ln)
+                   for ln in out.body_lines_markup)
 
 
 # ===========================================================================
@@ -565,3 +569,61 @@ def test_view_module_imports_substrate_only():
         assert "from rich" not in src and "import rich" not in src, (
             f"{mod.__name__} must not import Rich — that belongs to Slice 4"
         )
+
+
+# ---------------------------------------------------------------------------
+# Shell command visibility (Claude Code idiom) — bash shows `$ <command>`
+# ---------------------------------------------------------------------------
+
+
+def test_a_bash_call_shows_the_command_on_a_dollar_line(monkeypatch):
+    monkeypatch.delenv("JARVIS_SHELL_COMMAND_LINE_ENABLED", raising=False)
+    out = compose(
+        "bash", "pytest -q tests/foo.py", "3 passed",
+        explicit_density=_density(max_body_lines=10),
+        store=BoundedBodyStore(capacity=10),
+    )
+    joined = "\n".join(out.body_lines_markup)
+    assert "$ pytest -q tests/foo.py" in joined
+    # The command line leads the body, above the output.
+    assert out.body_lines_markup[0].strip().startswith(("$", "[")) and "$ pytest" in out.body_lines_markup[0]
+
+
+def test_a_non_bash_call_has_no_dollar_line():
+    out = compose(
+        "read_file", "backend/x.py", "9 lines",
+        explicit_density=_density(max_body_lines=10),
+        store=BoundedBodyStore(capacity=10),
+    )
+    assert not any("$ " in ln for ln in out.body_lines_markup)
+
+
+def test_the_command_line_strips_ansi_escape_codes():
+    out = compose(
+        "bash", "echo \x1b[31mred\x1b[0m done", "ok",
+        explicit_density=_density(max_body_lines=10),
+        store=BoundedBodyStore(capacity=10),
+    )
+    joined = "\n".join(out.body_lines_markup)
+    assert "\x1b[" not in joined and "$ echo red done" in joined
+
+
+def test_a_heredoc_command_is_flattened_and_clipped(monkeypatch):
+    monkeypatch.setenv("JARVIS_SHELL_COMMAND_MAX_CHARS", "40")
+    out = compose(
+        "bash", "for i in 1 2 3; do\n  echo very-long-loop-body-$i\ndone",
+        "ok", explicit_density=_density(max_body_lines=10),
+        store=BoundedBodyStore(capacity=10),
+    )
+    line = out.body_lines_markup[0]
+    assert "\n" not in line and "…" in line
+
+
+def test_the_command_line_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("JARVIS_SHELL_COMMAND_LINE_ENABLED", "false")
+    out = compose(
+        "bash", "ls -la", "ok",
+        explicit_density=_density(max_body_lines=10),
+        store=BoundedBodyStore(capacity=10),
+    )
+    assert not any("$ ls" in ln for ln in out.body_lines_markup)

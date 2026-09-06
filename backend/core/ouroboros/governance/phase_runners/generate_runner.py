@@ -1862,6 +1862,31 @@ class GENERATERunner(PhaseRunner):
                 _err_msg = str(exc)
                 _route = getattr(ctx, "provider_route", "")
 
+                # ── PARTIAL-FLUSH (root-cause resilience) ──
+                # A tool loop that RAISED or TIMED OUT attaches the records
+                # it did run to the exception (tool_executor._attach_tool_
+                # records). Bind a minimal generation carrying them to ctx
+                # HERE, at the top of the one failure handler, so every
+                # failure terminal below — and the recap the seam draws from
+                # ctx.generation — reflects the PARTIAL execution instead of
+                # dropping it to zero. Only when nothing real is bound yet
+                # (never overwrite a genuine generation). Same late-bind idiom
+                # as the success path. NEVER raises into the handler.
+                try:
+                    _partial_recs = getattr(exc, "tool_execution_records", ()) or ()
+                    if _partial_recs and getattr(ctx, "generation", None) is None:
+                        from backend.core.ouroboros.governance.op_context import (  # noqa: E501,PLC0415
+                            GenerationResult as _PartialGen,
+                        )
+                        object.__setattr__(ctx, "generation", _PartialGen(
+                            candidates=(),
+                            provider_name="partial_tool_flush",
+                            generation_duration_s=0.0,
+                            tool_execution_records=tuple(_partial_recs),
+                        ))
+                except Exception:  # noqa: BLE001 — a flush must never break the handler
+                    pass
+
                 # ── Sovereign Egress Interceptor Mesh (T3) — route-back ──
                 # The LIVE generate-failure handler. When OUR egress interceptor
                 # blocked an over-ceiling DW body (LocalEgressOverweightError,

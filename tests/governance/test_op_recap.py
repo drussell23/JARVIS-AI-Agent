@@ -200,3 +200,17 @@ def test_a_noop_generation_still_carries_its_tool_records_to_the_recap():
                            tools=r.tool_count(gen), tokens=r.output_tokens(gen),
                            done_at="2:15 PM")
     assert "4 tools used" in line and "↑ 147 tokens" in line
+
+
+def test_a_failed_tool_loop_flushes_its_partial_records_to_ctx():
+    """Phase 3 resilience: a tool loop that raised attaches the records it
+    DID run to the exception; the runner binds a partial generation carrying
+    them so the recap reflects the partial effort, not zero."""
+    import inspect
+    from backend.core.ouroboros.governance.phase_runners import generate_runner as gr
+    src = inspect.getsource(gr)
+    assert 'getattr(exc, "tool_execution_records", ())' in src
+    assert "partial_tool_flush" in src
+    # Bound only when nothing real is bound yet — never overwrites a genuine
+    # generation.
+    assert 'getattr(ctx, "generation", None) is None' in src

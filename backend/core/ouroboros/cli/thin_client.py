@@ -134,6 +134,13 @@ def _boot_wait_s() -> float:
     return _BOOT_WAIT_FLOOR_S
 
 
+#: POSIX ``sysexits.h`` EX_CONFIG, as the daemon spends it: the pinned
+#: model is not one this node serves. Declared here as well because this
+#: module must not import the daemon script to read one integer, and a
+#: test pins the two to stay equal — a code the client mis-reads would put
+#: a crash message over a configuration refusal.
+EXIT_MODEL_PIN_UNAVAILABLE = 78
+
 #: How many stall windows a boot may take in TOTAL. The stall window says
 #: how long silence is tolerated; this says how long the whole thing may
 #: run even while it keeps talking. 4x.
@@ -1091,6 +1098,22 @@ async def ensure_daemon(
             rc = proc.poll()
         except Exception:  # noqa: BLE001
             pass
+        if rc == EXIT_MODEL_PIN_UNAVAILABLE:
+            # A CONFIGURATION REFUSAL, not a failure to start. The daemon
+            # declined because the pinned model is not served, and it
+            # already printed the full alert — pin, source, what the node
+            # offers, and the fix. Repeating "the organism did not come
+            # up" over that would describe a crash that did not happen and
+            # send the operator to the wrong log.
+            #
+            # Retrying is pointless here, unlike EX_TEMPFAIL below: nothing
+            # resolves on its own. So this returns immediately and names
+            # the log that holds the alert.
+            _say(
+                "⚠ the organism declined to start: the pinned model is not "
+                "served. The full alert is in " + str(daemon_log_path())
+            )
+            return False
         if rc == 75:                      # EX_TEMPFAIL — single-flight
             # A REFUSAL IS USUALLY TRANSIENT, so retrying is the cockpit's job
             # rather than the operator's.

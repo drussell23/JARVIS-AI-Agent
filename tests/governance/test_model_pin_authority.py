@@ -297,3 +297,32 @@ def test_the_gate_has_its_own_exit_code() -> None:
     src = _SCRIPT.read_text(encoding="utf-8")
     assert "EXIT_MODEL_PIN_UNAVAILABLE = 78" in src
     assert "sys.exit(EXIT_MODEL_PIN_UNAVAILABLE)" in src
+
+
+def test_the_client_and_the_daemon_agree_on_that_code() -> None:
+    """Two declarations, because the client must not import the daemon
+    script to read one integer. A code the client mis-reads would put a
+    crash message over a configuration refusal."""
+    from backend.core.ouroboros.cli import thin_client as tc
+    src = _SCRIPT.read_text(encoding="utf-8")
+    daemon_value = int(
+        src.split("EXIT_MODEL_PIN_UNAVAILABLE = ", 1)[1].split("\n", 1)[0]
+    )
+    assert tc.EXIT_MODEL_PIN_UNAVAILABLE == daemon_value == 78
+
+
+def test_the_client_does_not_retry_a_configuration_refusal() -> None:
+    """Unlike EX_TEMPFAIL, nothing here resolves on its own."""
+    tree = ast.parse(
+        (_REPO / "backend" / "core" / "ouroboros" / "cli"
+         / "thin_client.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        if "EXIT_MODEL_PIN_UNAVAILABLE" not in ast.dump(node.test):
+            continue
+        body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
+        assert "_await_ignition_window" not in body, "must not retry"
+        assert "Return" in body, "must return immediately"
+        return
+    pytest.fail("no branch handles the configuration refusal")

@@ -78,7 +78,7 @@ import enum
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
     role_palette as _role_palette,
@@ -242,6 +242,22 @@ class ClaudeStyleTransport:
         self._op_state: Dict[str, _OpState] = {}
         self._boot_recovery_count: int = 0
         self._boot_recovery_flushed: bool = False
+        # THE COCKPIT MIRROR — same name and contract as
+        # ``SerpentFlow.markup_mirror``, so the harness wires both with one
+        # idiom (``transport.markup_mirror = bridge.publish_markup``).
+        #
+        # Why it exists, measured 2026-09-06: this transport is the DEFAULT
+        # (``JARVIS_RENDER_MODE=CLAUDE``) and every line it rendered went to
+        # ``self._console`` alone. On a headless daemon that console is the
+        # log file. An attached cockpit therefore showed a live prompt, a
+        # live status line and an EMPTY transcript while the organism ran
+        # forty-seven generations — the operator was watching a process
+        # that had no channel to them. SerpentFlow had a mirror; the
+        # transport that replaced it as default did not.
+        #
+        # ``None`` until wired. Every rendered line passes through
+        # ``_safe_print``, so that one seam is where the mirror fires.
+        self.markup_mirror: Optional[Callable[[str], None]] = None
         # CC2.1 — running counters for TASK_LIST composer field
         self._done_count: int = 0
         self._failed_count: int = 0
@@ -296,8 +312,12 @@ class ClaudeStyleTransport:
             if msg_type == "INTENT":
                 self._handle_intent(op_id, payload)
             elif msg_type == "HEARTBEAT":
-                if show_heartbeats():
-                    self._handle_heartbeat(op_id, payload)
+                # Not pre-gated here. Two kinds of message share this type
+                # -- phase ticks and tool calls -- and they have different
+                # gates. Deciding on `show_heartbeats()` at the dispatch
+                # silenced tool activity along with the ticks; the handler
+                # reads the payload and applies the gate that fits it.
+                self._handle_heartbeat(op_id, payload)
             elif msg_type == "DECISION":
                 self._handle_decision(op_id, payload)
             elif msg_type == "POSTMORTEM":
@@ -381,13 +401,106 @@ class ClaudeStyleTransport:
     def _handle_heartbeat(
         self, op_id: str, payload: Dict[str, Any],
     ) -> None:
-        """HEARTBEAT — phase tick. Default: silent. When
-        JARVIS_CLAUDE_STYLE_SHOW_HEARTBEATS=true, render
-        ``  └ <phase>``."""
+        """HEARTBEAT — a phase tick, or a TOOL CALL riding the same type.
+
+        Two different things arrive here and they were treated as one.
+        ``ToolNarrationChannel`` emits every Venom tool call as a HEARTBEAT
+        whose payload carries ``tool_name`` / ``tool_args_summary`` /
+        ``result_preview``. This handler read only ``phase`` and printed
+        ``└ generate`` — the tool name, its arguments and its result were
+        discarded, and only when ``show_heartbeats()`` was on, which it is
+        not by default. So the one channel that carries what the organism
+        is DOING rendered nothing, on the default transport, to anyone.
+
+        Now: a payload with ``tool_name`` renders a CC-style tool block
+        through ``tool_render_view.compose_if_enabled`` — the SAME composer
+        ``SerpentFlow.op_tool_call`` uses, so both transports draw one
+        idiom — under the channel's own master gate
+        (``cockpit_attach.tool_activity_enabled``, default ON), which is
+        about tool activity and not about phase ticks. A plain phase tick
+        keeps its old behaviour and its old gate.
+
+        Only the COMPLETION renders. The start event drives a spinner in
+        SerpentFlow; a line stream has no spinner, and printing both would
+        show every tool twice.
+        """
+        tool_name = str(payload.get("tool_name", "") or "").strip()
+        if tool_name:
+            if payload.get("tool_starting"):
+                return
+            self._render_tool_call(op_id, tool_name, payload)
+            return
+        if not show_heartbeats():
+            return
         phase = str(payload.get("phase", "") or "").lower()
         if not phase or op_id not in self._op_state:
             return
         self._safe_print(f"  [dim]└ {phase}[/dim]")
+
+    def _render_tool_call(
+        self, op_id: str, tool_name: str, payload: Dict[str, Any],
+    ) -> None:
+        """One completed tool call, in the tool-activity idiom. NEVER raises.
+
+        Composition is delegated so this transport owns no second opinion
+        about how a tool block looks; when the registry composer is off, a
+        minimal header in this transport's own palette is emitted rather
+        than nothing, because an empty transcript is the defect.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.cockpit_attach import (
+                tool_activity_enabled,
+            )
+            if not tool_activity_enabled():
+                return
+        except Exception:  # noqa: BLE001 — gate unavailable → channel on
+            pass
+        args = str(payload.get("tool_args_summary", "") or "")
+        result = str(payload.get("result_preview", "") or "")
+        status = str(payload.get("status", "") or "success")
+        try:
+            duration_ms = float(payload.get("duration_ms", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            duration_ms = 0.0
+        composed = None
+        try:
+            from backend.core.ouroboros.battle_test.tool_render_view import (
+                compose_if_enabled, store_for_view,
+            )
+            composed = compose_if_enabled(
+                tool_name, args, result,
+                status=status, duration_ms=duration_ms, op_id=op_id,
+                round_index=int(payload.get("round_index", 0) or 0),
+                palette=_SEM, store=store_for_view(),
+            )
+        except Exception:  # noqa: BLE001 — composer fault → minimal line
+            composed = None
+        if composed is not None:
+            for line in (
+                composed.header_markup, composed.summary_markup,
+                *composed.body_lines_markup, composed.expansion_hint,
+            ):
+                if line:
+                    self._safe_print(f"  {line}")
+            return
+        # No `rich` import here — an authority invariant of this module,
+        # AST-pinned. Escaping every "[" is a strict superset of what
+        # rich.markup.escape neutralises, so model-controlled text can
+        # never open a tag.
+        def _escape(s: str) -> str:
+            return str(s).replace("[", "\\[")
+
+        tone = _SEM["death"] if status not in ("success", "ok") else _SEM["dim"]
+        head = f"  [{_SEM['dim']}]⏺[/] [bold]{_escape(tool_name)}[/bold]"
+        if args:
+            head += f"([dim]{_escape(args[:60])}[/dim])"
+        if status not in ("success", "ok"):
+            head += f" [{tone}]{_escape(status)}[/]"
+        self._safe_print(head)
+        if result:
+            self._safe_print(
+                f"    [{_SEM['dim']}]⎿[/]  [dim]{_escape(result[:120])}[/dim]"
+            )
 
     def _handle_decision(
         self, op_id: str, payload: Dict[str, Any],
@@ -530,7 +643,21 @@ class ClaudeStyleTransport:
 
     def _safe_print(self, text: str) -> None:
         """Console.print with defensive try/except. Falls back to
-        logger DEBUG if console is missing or print raises."""
+        logger DEBUG if console is missing or print raises.
+
+        ONE seam for both surfaces. The cockpit mirror fires here, before
+        the local print and independently of it, so a daemon whose console
+        is a log file still reaches every attached terminal, and a mirror
+        fault can never cost the local render. The raw markup travels; each
+        client fits it to its own canvas.
+        """
+        mirror = self.markup_mirror
+        if mirror is not None:
+            try:
+                mirror(text)
+            except Exception:  # noqa: BLE001 — a mirror never breaks the render
+                logger.debug("[claude_style_transport] mirror degraded",
+                             exc_info=True)
         try:
             console = self._console
             if console is not None and hasattr(console, "print"):

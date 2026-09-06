@@ -1045,6 +1045,20 @@ def _liquidity_lines(providers: Any, *, any_exhausted: Any = None,
     return lines
 
 
+def _ambient_transcript_enabled() -> bool:
+    """Do autonomous frames land in the transcript as well as the deck?
+
+    ``JARVIS_COCKPIT_AMBIENT_TRANSCRIPT`` (default ON). OFF restores the
+    deck-only routing byte-for-byte, which is the only honest A/B for a
+    change to what the operator's main pane shows. NEVER raises.
+    """
+    try:
+        return (os.environ.get("JARVIS_COCKPIT_AMBIENT_TRANSCRIPT", "1")
+                .strip().lower() in ("1", "true", "yes", "on"))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _split_plane_verdict() -> Any:
     """WHY the split plane can or cannot run — not merely whether.
 
@@ -4583,7 +4597,48 @@ def run_attach(console: Any) -> int:
                     pass
                 _render_markup_frame(text, console)
                 return
+            # AUTONOMOUS WORK IS THE TRANSCRIPT.
+            #
+            # This line used to be the whole ambient branch: every frame the
+            # organism produced on its own initiative went to the deck — a
+            # four-row strip that ages out in sixty seconds — and never to
+            # the canvas. For a REACTIVE tool that is the right split: the
+            # transcript is what you asked for. O+V is proactive; what it
+            # does unasked is the product, and the operator sat before a
+            # live prompt, a live status line and an empty pane while the
+            # daemon ran forty-seven generations (measured 2026-09-06).
+            #
+            # The deck keeps its job. It exists because the agora never stops
+            # talking and an operational alert must not scroll away under a
+            # joke; that is a severity problem the deck already solves with
+            # pinning and compaction. So the split is by SEVERITY, using the
+            # deck's own classifier rather than a second one: SOCIAL stays
+            # deck-only, everything the organism is DOING lands in the
+            # transcript as well, through the same renderer addressed output
+            # uses. Nothing is duplicated; a line can live in two places
+            # because they answer different questions — "what is happening"
+            # and "what needs me".
             ui.on_ambient(text)
+            if not _ambient_transcript_enabled():
+                return
+            try:
+                from backend.core.ouroboros.battle_test.ambient_deck import (
+                    Severity, classify,
+                )
+                severity, _key = classify(text)
+                if severity is Severity.SOCIAL:
+                    return
+                from backend.core.ouroboros.battle_test.bipartite_layout import (
+                    get_active_canvas,
+                )
+                # Only where a transcript exists to receive it. The legacy
+                # pump has no canvas and already prints ambient lines
+                # inline; pushing there would print them twice.
+                if get_active_canvas() is None:
+                    return
+                _render_markup_frame(text, console)
+            except Exception:  # noqa: BLE001 — a transcript miss never breaks attach
+                pass
 
         client = CockpitAttachClient(
             on_hydration=_on_hydration, on_line=_print_line,

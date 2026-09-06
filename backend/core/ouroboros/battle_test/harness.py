@@ -3165,6 +3165,13 @@ class BattleTestHarness:
                     _chosen_transport = SerpentTransport(flow=self._serpent_flow)
                     _render_mode_label = "serpent"
 
+                # RETAINED, not just registered. The attach bridge is armed
+                # later (`_start_cockpit_attach_bridge`), and it wires the
+                # cockpit mirror onto whatever renders per-op activity. A
+                # local that goes out of scope here cannot be wired there —
+                # which is exactly how the default transport ran for months
+                # with a live comm feed and no path to the cockpit.
+                self._per_op_transport = _chosen_transport
                 if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
                     self._governance_stack.comm._transports.append(
                         _chosen_transport,
@@ -5364,6 +5371,16 @@ class BattleTestHarness:
                         )
                     except Exception:  # noqa: BLE001
                         pass
+                    # THE PER-OP TRANSPORT, whichever mode chose it. Under
+                    # the default CLAUDE mode SerpentFlow is not the renderer
+                    # of op activity — `ClaudeStyleTransport` is — and until
+                    # this line it had no mirror. Same attribute, same
+                    # idiom, one publisher; a transport without the
+                    # attribute (legacy SerpentTransport renders through
+                    # SerpentFlow, which is wired just below) is left alone.
+                    _pot = getattr(self, "_per_op_transport", None)
+                    if _pot is not None and hasattr(_pot, "markup_mirror"):
+                        _pot.markup_mirror = bridge.publish_markup
                     sf = getattr(self, "_serpent_flow", None)
                     if sf is not None:
                         sf.markup_mirror = bridge.publish_markup

@@ -596,6 +596,30 @@ def _render_hydration(console: Any, payload: dict) -> None:
         head.append(str(phase), style=_body)
         if detail:
             head.append(f" {detail}", style=_muted)
+        # WHICH MODEL IS GENERATING belongs on the first frame.
+        #
+        # This line gave a whole field to cost and none to the model. On a
+        # local lane that is backwards: cost is structurally $0.00 against a
+        # ceiling nothing can spend (see the two comments below, which
+        # already fought to stop that number implying a balance), while the
+        # model is the one thing that actually changes between sessions --
+        # base vs fine-tuned adapter, and no way to tell them apart.
+        #
+        # Read through `_model_pin()`, the same accessor the generation lane
+        # uses, so the banner cannot disagree with what actually answers.
+        # Empty means no explicit pin (auto-select), and the field is then
+        # omitted rather than guessed at: naming a model we are not certain
+        # of is worse than naming none.
+        try:
+            from backend.core.ouroboros.governance.candidate_generator import (
+                _model_pin as _pin,
+            )
+            _model = _pin()
+        except Exception:  # noqa: BLE001 — a banner never breaks an attach
+            _model = ""
+        if _model:
+            head.append(f"  {_dot}  model ", style=_muted)
+            head.append(_model, style=_body)
         head.append(f"  {_dot}  cost ", style=_muted)
         head.append(f"${cost:.2f}", style=_body)
         head.append(f"/${budget:.2f}", style=_muted)

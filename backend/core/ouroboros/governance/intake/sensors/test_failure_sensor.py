@@ -23,8 +23,10 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 
 from backend.core.ouroboros.governance.intent.signals import IntentSignal
 from backend.core.ouroboros.governance.intent.test_source_attribution import (
+    attribute_strict_or_none,
     attribution_enabled,
     prewarm_module_map,
+    strict_isolation_enabled,
 )
 from backend.core.ouroboros.governance.intent.test_watcher import TestFailure
 from backend.core.ouroboros.governance.workspace_resolver import resolve_repo_root
@@ -891,6 +893,39 @@ class TestFailureSensor:
                 await prewarm_module_map(self._watcher.repo_path)
         except Exception:
             logger.debug("[CacheFirstHydration] prewarm failed", exc_info=True)
+        # Anti-noise (soak bt-2026-09-06): a force-promoted lastfailed red has
+        # no traceback, so attribution would spray every imported module. Keep
+        # ONLY reds whose failing source is deterministically ISOLABLE; discard
+        # the rest here — at the sensor — so the orchestrator queue is never
+        # polluted with a 6-file import spray the generator can only no-op.
+        # Gated by the strict-isolation master; OFF -> byte-identical (no
+        # filtering). The module-map is already warm from the prewarm above, so
+        # each check is a dict cache-hit, never an on-loop crawl.
+        if attribution_enabled() and strict_isolation_enabled():
+            _repo = self._watcher.repo_path
+            _kept: List[TestFailure] = []
+            _discarded = 0
+            for _f in failures:
+                try:
+                    _attr = attribute_strict_or_none(
+                        _f.file_path, repo_root=_repo, traceback_frames=(),
+                    )
+                except Exception:  # noqa: BLE001 — filter is best-effort
+                    _attr = None
+                if _attr is None:
+                    _discarded += 1
+                else:
+                    _kept.append(_f)
+            if _discarded:
+                logger.info(
+                    "[CacheFirstHydration] discarded %d unmappable stale red(s) "
+                    "(no traceback, source not isolable) — not enqueuing an "
+                    "import spray; %d isolable red(s) kept",
+                    _discarded, len(_kept),
+                )
+            failures = _kept
+            if not failures:
+                return 0
         try:
             signals = self._watcher.process_failures(failures)
         except Exception:

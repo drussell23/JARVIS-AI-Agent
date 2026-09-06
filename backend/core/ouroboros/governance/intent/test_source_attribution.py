@@ -342,6 +342,127 @@ def attribute_test_to_sources(
 
 
 # ---------------------------------------------------------------------------
+# Strict source ISOLATION (anti-noise) — used by force-promoted signals that
+# carry no fresh failure evidence (the pytest ``lastfailed`` cache-first path).
+# ---------------------------------------------------------------------------
+#
+# THE NOISE CLASS (soak bt-2026-09-06-212249): the cache-first hydration
+# force-promotes a persisted ``lastfailed`` node-id to a "stable" signal
+# WITHOUT re-running the test, so it carries no traceback. With no traceback
+# ``attribute_test_to_sources`` cannot narrow, and every first-party module the
+# test imports becomes a target (one op scoped 6 files). The generator then
+# correctly returns ``2b.1-noop`` for each — 30 no-ops, 0 commits in one soak.
+# The root cause is that an un-reproduced cache id has no evidence of WHICH
+# source is at fault; enqueuing a spray of imports is not actionable work.
+#
+# This predicate keeps a signal ONLY when the failing source is deterministically
+# ISOLABLE, and returns ``None`` (the caller DISCARDS) otherwise — so the queue
+# is fed real, narrowly-scoped work instead of import sprays. It is a pure
+# refinement over ``attribute_test_to_sources`` (mandate 3: no new parser, no
+# duplicated import tracing) and it NEVER raises.
+
+
+def strict_isolation_enabled() -> bool:
+    """Master for strict source isolation (default ON). OFF restores the
+    pre-existing spray-all-imports behaviour byte-identically."""
+    return os.environ.get(
+        "JARVIS_ATTRIBUTION_STRICT_ISOLATION_ENABLED", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _strict_max_loci() -> int:
+    """Max first-party source files a NO-TRACEBACK signal may resolve to and
+    still count as 'isolated'. Default 1 — an un-reproduced failure that maps
+    to more than one module cannot be pinned, so it is discarded rather than
+    sprayed. Env-tunable; clamped to >=1."""
+    try:
+        return max(1, int(os.environ.get(
+            "JARVIS_ATTRIBUTION_STRICT_MAX_LOCI", "1",
+        )))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _narrowed(attr: "Attribution", loci: Tuple[str, ...]) -> "Attribution":
+    """Rebuild an ``Attribution`` restricted to *loci* (a subset of
+    ``attr.source_loci``), carrying each locus's original evidence kind so
+    ``method``/``evidence_kinds`` stay honest. Order follows *loci*."""
+    kind_of = dict(zip(attr.source_loci, attr.evidence_kinds))
+    kinds = tuple(kind_of.get(p, _KIND_DIRECT) for p in loci)
+    present = set(kinds)
+    method = "+".join(
+        k for k in (_KIND_DIRECT, _KIND_PATCH) if k in present
+    )
+    return Attribution(
+        test_locus=attr.test_locus,
+        source_loci=loci,
+        method=method,
+        evidence_kinds=kinds,
+    )
+
+
+def attribute_strict_or_none(
+    test_file: str,
+    *,
+    repo_root: str,
+    traceback_frames: Sequence[str] = (),
+) -> Optional[Attribution]:
+    """Precision-first attribution for force-promoted / low-evidence signals.
+
+    Returns a (possibly narrowed) :class:`Attribution` ONLY when the failing
+    source is deterministically isolable; returns ``None`` when it is not — the
+    caller then DISCARDS the signal instead of enqueuing an import spray.
+    NEVER raises.
+
+    Decision tree (the middle branch preserves the Run-16 assertion class):
+
+      * ``attribute_test_to_sources`` raises ``AttributionUnresolved`` (no
+        first-party source reachable) -> ``None``.
+      * **traceback intersects >=1 source locus** -> narrow to the intersection.
+        An exception-style failure's traceback IS the evidence of the faulting
+        module; keep exactly those.
+      * **traceback present but hits no source locus** (assertion failure whose
+        deepest in-repo frame is the test line — the Run-16 class) -> keep the
+        full import-based attribution. This is a real, freshly-reproduced
+        failure and imports are the only signal; it is NOT discarded.
+      * **no traceback at all** (cache-first force-promotion) -> keep ONLY when
+        the import set already isolates to ``<= _strict_max_loci()`` files;
+        otherwise ``None`` (discard the spray).
+
+    Master ``JARVIS_ATTRIBUTION_STRICT_ISOLATION_ENABLED`` (default on); OFF
+    behaves exactly like ``attribute_test_to_sources`` wrapped to return
+    ``None`` on ``AttributionUnresolved`` (no discard-on-breadth)."""
+    try:
+        attr = attribute_test_to_sources(
+            test_file, repo_root=repo_root, traceback_frames=traceback_frames,
+        )
+    except AttributionUnresolved:
+        return None
+    except Exception:  # noqa: BLE001 — isolation must never break a poll
+        return None
+
+    if not strict_isolation_enabled():
+        return attr
+
+    try:
+        tb_hits = {
+            _relpath_under_root(f, repo_root) or str(f).replace("\\", "/")
+            for f in (traceback_frames or ())
+        }
+        if tb_hits:
+            inter = tuple(p for p in attr.source_loci if p in tb_hits)
+            if inter:
+                return _narrowed(attr, inter)  # narrowed to the faulting frame
+            return attr  # Run-16: assertion at the test line — keep imports
+        # No traceback: keep only a genuinely isolated set.
+        if len(attr.source_loci) <= _strict_max_loci():
+            return attr
+        return None
+    except Exception:  # noqa: BLE001 — on any error, do not fabricate isolation
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Scope-gate predicate (Task 5 wires this at the orchestrator)
 # ---------------------------------------------------------------------------
 

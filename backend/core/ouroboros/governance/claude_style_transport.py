@@ -245,6 +245,38 @@ def line_chars() -> int:
     return _read_int_flag(_FLAG_LINE_CHARS, _DEFAULT_LINE_CHARS, _MIN_LINE_CHARS)
 
 
+def _line_chars_pinned() -> bool:
+    """Whether the operator explicitly fixed the narration column. When they
+    have, that pin wins over the dynamic viewport reflow."""
+    try:
+        import os  # noqa: PLC0415
+        if os.environ.get(_FLAG_LINE_CHARS):
+            return True
+        reg = _get_registry()
+        return bool(reg is not None and reg.get_str(_FLAG_LINE_CHARS, default=""))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def narration_viewport() -> int:
+    """The width the organism's narration (💭 / 🗣 prose) reflows to fill —
+    the ATTACHED cockpit's actual terminal width, resolved from its declared
+    caps through the one geometry authority (``terminal_capabilities.
+    effective_width``), so a 200-column terminal gets 200-column prose and a
+    resize is honoured on the next line. Returns 0 when the operator pinned a
+    fixed column (``JARVIS_CLAUDE_STYLE_LINE_CHARS``) — then ``line_chars``
+    stands — or when no display has ever declared a width. NEVER raises."""
+    if _line_chars_pinned():
+        return 0
+    try:
+        from backend.core.ouroboros.battle_test.terminal_capabilities import (
+            effective_width,
+        )
+        return int(effective_width())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def detail_lines() -> int:
     """Lines of the model's words under an outcome (``JARVIS_CLAUDE_STYLE_DETAIL_LINES``)."""
     return _read_int_flag(_FLAG_DETAIL_LINES, _DEFAULT_DETAIL_LINES, 1)
@@ -972,6 +1004,9 @@ class ClaudeStyleTransport:
             render_to_printer(
                 frame, self._print_narrative,
                 op_active=False, max_chars_per_line=line_chars(),
+                # Reflow to the cockpit's real width; the fixed column is the
+                # fallback when a width is pinned or none has been declared.
+                viewport_width=narration_viewport(),
             )
         except Exception:  # noqa: BLE001
             logger.debug("[claude_style_transport] narrative render failed",

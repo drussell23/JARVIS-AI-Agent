@@ -214,6 +214,7 @@ def compose(
     *,
     op_active: bool = True,
     max_chars_per_line: int = 0,
+    viewport_width: int = 0,
 ) -> RenderedFrame:
     """Render a :class:`NarrativeFrame` to Rich-markup string ready for
     ``Console.print``.
@@ -262,8 +263,21 @@ def compose(
     # Line wrapping (only when caller asks). The opening glyph is on
     # the FIRST line; wrapped continuations indent under it via a
     # zero-width space-equivalent so the prose visually flows.
-    if max_chars_per_line > 0:
-        lines = _wrap_prose(escaped, max_chars_per_line)
+    # The prose column. When a VIEWPORT width is given (the cockpit's actual
+    # terminal width, resolved from its declared caps), the prose reflows to
+    # fill it: the column is the viewport minus the MEASURED indent+glyph
+    # geometry — the first line carries `{indent}{glyph} `, continuations
+    # carry `{indent}   `, and the wrap must fit the wider of the two. No
+    # hardcoded margin; the overhead is derived from the actual glyph width.
+    # Absent a viewport, the caller's fixed ``max_chars_per_line`` stands
+    # (an operator pin, or a headless default).
+    wrap_at = max_chars_per_line
+    if viewport_width and int(viewport_width) > 0:
+        _first = _visual_len(indent) + _visual_len(style.glyph) + 1
+        _cont = _visual_len(indent) + 3
+        wrap_at = max(_MIN_PROSE_COLS, int(viewport_width) - max(_first, _cont))
+    if wrap_at and wrap_at > 0:
+        lines = _wrap_prose(escaped, wrap_at)
     else:
         lines = [escaped]
 
@@ -286,6 +300,27 @@ def compose(
         glyph=style.glyph,
         style_str=style_str,
     )
+
+
+#: The narrowest prose column the reflow will ever produce — a floor, so a
+#: pathologically small viewport yields short lines rather than one-character
+#: columns. NOT a margin: the wrap width is DERIVED from the viewport minus
+#: the measured indent+glyph, and only clamped up to this if that goes absurd.
+_MIN_PROSE_COLS = 24
+
+
+def _visual_len(text: object) -> int:
+    """Display columns of ``text`` — wcwidth-aware, so a 2-cell 💭 counts as
+    two. Falls back to ``len`` when wcwidth is unavailable. NEVER raises."""
+    s = str(text or "")
+    try:
+        from wcwidth import wcswidth  # noqa: PLC0415
+        w = wcswidth(s)
+        if w and w > 0:
+            return int(w)
+    except Exception:  # noqa: BLE001
+        pass
+    return len(s)
 
 
 def _wrap_prose(text: str, max_chars: int) -> list:
@@ -324,6 +359,7 @@ def render_to_console(
     *,
     op_active: bool = True,
     max_chars_per_line: int = 0,
+    viewport_width: int = 0,
 ) -> bool:
     """Compose + emit. Returns ``True`` on success, ``False`` if the
     frame produced no markup or the console raised.
@@ -340,6 +376,7 @@ def render_to_console(
     return render_to_printer(
         frame, print_fn,
         op_active=op_active, max_chars_per_line=max_chars_per_line,
+        viewport_width=viewport_width,
     )
 
 
@@ -349,6 +386,7 @@ def render_to_printer(
     *,
     op_active: bool = True,
     max_chars_per_line: int = 0,
+    viewport_width: int = 0,
 ) -> bool:
     """The surfacing seam behind :func:`render_to_console`, for a surface
     whose sink is not a console -- a transport that mirrors every line to
@@ -375,6 +413,7 @@ def render_to_printer(
         frame,
         op_active=op_active,
         max_chars_per_line=max_chars_per_line,
+        viewport_width=viewport_width,
     )
     if not rendered.markup:
         return False

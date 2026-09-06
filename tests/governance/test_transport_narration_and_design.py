@@ -621,3 +621,56 @@ def test_the_terminal_seam_is_wired_once_at_the_chokepoint():
     assert src.count("await self._emit_terminal_decision(ctx, state, data)") == 1
     assert src.index("_slice12q_record_terminal(ctx, state, data)") < src.index(
         "await self._emit_terminal_decision(ctx, state, data)")
+
+
+# ---------------------------------------------------------------------------
+# Full-width narration reflow (Phase 1) — the prose fills the cockpit width
+# ---------------------------------------------------------------------------
+
+
+def test_narration_reflows_to_the_viewport_width():
+    from backend.core.ouroboros.battle_test.narrative_renderer import compose
+    prose = "word " * 60
+    frame = nc.NarrativeChannel(capacity=2).emit_complete(
+        op_id="op", phase="P", kind=nc.NarrativeKind.INTENT, prose=prose)
+    narrow = compose(frame, op_active=False, viewport_width=40).markup.split("\n")
+    wide = compose(frame, op_active=False, viewport_width=160).markup.split("\n")
+    assert len(wide) < len(narrow)                      # wider viewport, fewer rows
+    # Every rendered row fits its viewport (measured, incl. the 2-cell glyph).
+    from backend.core.ouroboros.battle_test.narrative_renderer import _visual_len
+    assert all(_visual_len(_strip_markup(r)) <= 40 for r in narrow)
+    assert all(_visual_len(_strip_markup(r)) <= 160 for r in wide)
+
+
+def _strip_markup(line: str) -> str:
+    import re
+    return re.sub(r"\[/?[^\]]*\]", "", line)
+
+
+def test_no_hardcoded_margin_the_overhead_is_the_measured_glyph():
+    """A one-word prose on a viewport just wide enough for `  💭 word` fits on
+    one line — proving the budget is viewport minus the MEASURED indent+glyph,
+    not a guessed constant."""
+    from backend.core.ouroboros.battle_test.narrative_renderer import (
+        compose, _visual_len,
+    )
+    frame = nc.NarrativeChannel(capacity=2).emit_complete(
+        op_id="op", phase="P", kind=nc.NarrativeKind.INTENT, prose="alpha")
+    # `  ` indent (2) + `💭` (2) + ` ` (1) + `alpha` (5) = 10 columns.
+    out = compose(frame, op_active=False, viewport_width=10).markup
+    assert out.count("\n") == 0 and "alpha" in out
+    assert _visual_len(_strip_markup(out)) == 10
+
+
+def test_an_operator_pin_overrides_the_dynamic_reflow(monkeypatch):
+    from backend.core.ouroboros.governance import claude_style_transport as cst
+    monkeypatch.setenv("JARVIS_CLAUDE_STYLE_LINE_CHARS", "50")
+    assert cst.narration_viewport() == 0                # pin wins → line_chars stands
+
+
+def test_the_viewport_comes_from_the_declared_cockpit_width(monkeypatch):
+    from backend.core.ouroboros.governance import claude_style_transport as cst
+    from backend.core.ouroboros.battle_test import terminal_capabilities as tc
+    monkeypatch.delenv("JARVIS_CLAUDE_STYLE_LINE_CHARS", raising=False)
+    monkeypatch.setattr(tc, "effective_width", lambda default=None: 137)
+    assert cst.narration_viewport() == 137              # the real terminal width

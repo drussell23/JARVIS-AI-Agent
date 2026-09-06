@@ -19,6 +19,7 @@ Test cases:
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 import json
 import time
 from pathlib import Path
@@ -911,7 +912,7 @@ _BP_JSON = (
 )
 
 
-def _rt_engine(tmp_path, dw=None, claude=None, jprime_url=""):
+def _rt_engine(tmp_path, dw=None, claude=None, jprime_url="", dw_bypass=False):
     from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
     d = tmp_path / "dreams"
     d.mkdir(exist_ok=True)
@@ -927,6 +928,13 @@ def _rt_engine(tmp_path, dw=None, claude=None, jprime_url=""):
     )
     eng._dw_provider = dw
     eng._claude_provider = claude
+    # The DW-RT health bypass reads the HOST's live surface ledger; a
+    # daemon that has logged hundreds of 503s would bypass DW in every
+    # test here. Host state is not this helper's input: the bypass is
+    # pinned OFF unless a test installs its own surface (`_surface`) and
+    # passes ``dw_bypass=None`` to exercise the real predicate.
+    if dw_bypass is not None:
+        eng._dw_health_bypass = lambda: bool(dw_bypass)
     return eng
 
 
@@ -991,6 +999,57 @@ async def test_full_cascade_exhaustion_raises_typed_error(tmp_path, monkeypatch)
     eng = _rt_engine(tmp_path, dw=dw, claude=claude, jprime_url="")  # no tier 3
     with pytest.raises(DreamProviderExhaustedError):
         await eng._call_inference("p")
+
+
+async def test_non_json_primary_cascades_to_the_next_tier(tmp_path):
+    """A tier that answers with prose is rejected by the gate's shape check
+    and the cascade moves on — the behaviour the hand-rolled cascade had."""
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(return_value=_SyncResult("not a json object"))
+    claude = MagicMock()
+    claude.prompt_only = AsyncMock(return_value=_BP_JSON)
+    eng = _rt_engine(tmp_path, dw=dw, claude=claude)
+    result = await eng._call_inference("dream prompt")
+    assert result["_inference_provider"] == "claude"
+    dw.complete_sync.assert_awaited_once()
+
+
+async def test_local_tier_completes_a_dream_when_cloud_is_dead(tmp_path, monkeypatch):
+    """The reason the dream cascade moved onto rt_gate: on a host whose only
+    lane is the local model, dreams exhausted forever (streak=4, cooldown
+    after cooldown, 2026-09-06) while a $0 lane sat idle."""
+    import backend.core.ouroboros.claude_fallback as cf
+    import backend.core.ouroboros.governance.local_inference_director as lid
+    monkeypatch.setattr(cf, "claude_inference",
+                        AsyncMock(side_effect=RuntimeError("no key")))
+    monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_DREAM_RT_TIMEOUT_S", "5")
+
+    class _Local:
+        def __init__(self, cfg, *a, **k):
+            self.closed = False
+
+        async def generate(self, prompt, **kw):
+            assert kw.get("response_format") == {"type": "json_object"}
+            return SimpleNamespace(content=_BP_JSON)
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr(lid, "LocalPrimeClient", _Local)
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(side_effect=RuntimeError("down"))
+    claude = MagicMock()
+    claude.prompt_only = AsyncMock(side_effect=RuntimeError("down too"))
+    eng = _rt_engine(tmp_path, dw=dw, claude=claude)
+    result = await eng._call_inference("dream prompt")
+    assert result["_inference_provider"] == "local"
+    assert result["title"] == "t"
+
+
+def test_the_legacy_http_tier_is_gone():
+    from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
+    assert not hasattr(DreamEngine, "_call_jprime_legacy")
 
 
 async def test_run_dream_job_handles_exhaustion_with_dormant(tmp_path):
@@ -1330,7 +1389,7 @@ async def test_degraded_dw_is_bypassed_instantly_no_timeout_tax(tmp_path, monkey
     dw.complete_sync = AsyncMock(return_value=_SyncResult(_BP_JSON))
     claude = MagicMock()
     claude.prompt_only = AsyncMock(return_value=_BP_JSON)
-    eng = _rt_engine(tmp_path, dw=dw, claude=claude)
+    eng = _rt_engine(tmp_path, dw_bypass=None, dw=dw, claude=claude)
     result = await eng._call_inference("p")
     assert result["_inference_provider"] == "claude"
     dw.complete_sync.assert_not_called()          # the 53s tax is gone
@@ -1341,7 +1400,7 @@ async def test_healthy_completion_surface_still_attempts_dw(tmp_path, monkeypatc
     _surface(monkeypatch, tmp_path, _SV.HEALTHY)
     dw = MagicMock()
     dw.complete_sync = AsyncMock(return_value=_SyncResult(_BP_JSON))
-    eng = _rt_engine(tmp_path, dw=dw, claude=MagicMock())
+    eng = _rt_engine(tmp_path, dw_bypass=None, dw=dw, claude=MagicMock())
     result = await eng._call_inference("p")
     assert result["_inference_provider"] == "doubleword"
     dw.complete_sync.assert_awaited_once()
@@ -1381,7 +1440,7 @@ async def test_recovery_tracer_fires_only_when_bypassed(tmp_path, monkeypatch):
     monkeypatch.setattr(_cap, "trace_direct_completion", _fake_trace)
 
     _surface(monkeypatch, tmp_path, _SV.HEALTHY)
-    eng = _rt_engine(tmp_path, dw=MagicMock(), claude=MagicMock())
+    eng = _rt_engine(tmp_path, dw_bypass=None, dw=MagicMock(), claude=MagicMock())
     await eng._trace_dw_recovery_if_bypassed()
     assert calls == []                              # healthy -> no probe cost
 

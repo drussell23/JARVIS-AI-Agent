@@ -304,6 +304,25 @@ class ConceptionProposalBridge:
 
     # -- axis resolution (lazy, DRY) --------------------------------------
 
+    async def _score_blueprint_offloaded(self, bp: Any) -> Any:
+        """Score on a worker thread. The value model's alignment axis embeds
+        the description (a multi-second ONNX run); ``route`` is a coroutine
+        and the index refuses to embed on the loop thread, so the scoring
+        must leave the loop to keep its alignment axis. Same substrate the
+        index's own offloaded scorers use; bare thread when it is absent."""
+        try:
+            from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501,PLC0415
+                offload,
+                is_offload_error,
+            )
+            res = await offload(self._score_blueprint, bp, cpu_bound=False)
+            if is_offload_error(res):
+                raise RuntimeError(f"offload failed: {res!r}")
+            return res
+        except ImportError:
+            import asyncio  # noqa: PLC0415
+            return await asyncio.to_thread(self._score_blueprint, bp)
+
     def _score_blueprint(self, bp: Any) -> Any:
         if self._score is not None:
             return self._score(bp)
@@ -428,7 +447,7 @@ class ConceptionProposalBridge:
             scored: List[Tuple[Any, Any]] = []
             for bp in candidates.values():
                 try:
-                    ev = self._score_blueprint(bp)
+                    ev = await self._score_blueprint_offloaded(bp)
                 except Exception:  # noqa: BLE001
                     self._errors += 1
                     continue

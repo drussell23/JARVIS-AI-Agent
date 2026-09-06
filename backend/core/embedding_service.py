@@ -266,6 +266,15 @@ class EmbeddingService:
         self._promotion_task: Optional[asyncio.Task] = None
         self._promotion_stable_count: int = 0
         self._tier_transitions: int = 0  # observability: total demote/promote events
+        # The promotion BREAKER. A missing package is not a transient
+        # condition: once the HIGH tier's import has failed, every poll
+        # would fail the same way for the life of this process. Measured
+        # 2026-09-06 (bt-2026-09-06-074921): "Promotion HIGH load failed (No
+        # module named 'sentence_transformers')" every two minutes, all
+        # session, each one a budget reservation taken and released for an
+        # import that cannot succeed. Set once, never cleared; the reason
+        # is reported on the observability surface.
+        self._promotion_unavailable_reason: Optional[str] = None
 
         # Register cleanup
         # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so the
@@ -396,7 +405,35 @@ class EmbeddingService:
             ),
             "promotion_stable_count": self._promotion_stable_count,
             "tier_transitions": self._tier_transitions,
+            "promotion_unavailable_reason": self._promotion_unavailable_reason,
         }
+
+    # ── Promotion breaker ─────────────────────────────────────────────
+    @staticmethod
+    def _import_fault(exc: BaseException) -> Optional[str]:
+        """The ImportError in ``exc``'s causal chain, if any, as text.
+        Walks ``__cause__``/``__context__`` because a constructor may wrap
+        the import failure before it reaches the promotion seam."""
+        seen: set = set()
+        cur: Optional[BaseException] = exc
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            if isinstance(cur, ImportError):
+                return f"{type(cur).__name__}: {cur}"
+            cur = cur.__cause__ or cur.__context__
+        return None
+
+    def _disable_promotion(self, reason: str) -> None:
+        """Trip the breaker: no further LITE→HIGH attempts this process.
+        Logged ONCE at WARNING with what would re-enable it."""
+        if self._promotion_unavailable_reason is not None:
+            return
+        self._promotion_unavailable_reason = reason
+        logger.warning(
+            "[EmbeddingService] HIGH tier unavailable (%s) — LITE→HIGH "
+            "promotion disabled for the life of this process; install the "
+            "package and restart to re-enable.", reason,
+        )
 
     # ── Model-construction seams (overridable for tests) ────────────────
     def _load_sentence_transformer(self) -> Any:
@@ -543,6 +580,9 @@ class EmbeddingService:
                     "demoting to fastembed LITE tier.", e,
                 )
                 self._release_component("sentence_transformer")
+                # The same absence that will fail every promotion poll: trip
+                # the breaker HERE so the poller is never even started.
+                self._disable_promotion(f"{type(e).__name__}: {e}")
                 return False
             except Exception as e:
                 logger.error(f"[EmbeddingService] ❌ HIGH tier load failed: {e}")
@@ -611,6 +651,8 @@ class EmbeddingService:
             return False
         if not (self._config.adaptive_tiering_enabled and self._config.promotion_enabled):
             return False
+        if self._promotion_unavailable_reason is not None:
+            return False                     # breaker tripped — nothing to poll
 
         if not self._pytorch_headroom_available():
             self._promotion_stable_count = 0
@@ -639,11 +681,15 @@ class EmbeddingService:
                     self._load_sentence_transformer, "HIGH(promotion)",
                 )
             except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "[EmbeddingService] Promotion HIGH load failed (%s) — staying on LITE.", e,
-                )
                 self._release_component("sentence_transformer")
                 self._promotion_stable_count = 0
+                fault = self._import_fault(e)
+                if fault is not None:
+                    self._disable_promotion(fault)   # permanent: the package is absent
+                else:
+                    logger.warning(
+                        "[EmbeddingService] Promotion HIGH load failed (%s) — staying on LITE.", e,
+                    )
                 return False
             self._model = new_model
             self._active_tier = EmbeddingTier.HIGH
@@ -664,6 +710,8 @@ class EmbeddingService:
         is running. Best-effort — promotion is opportunistic, never required."""
         if not (self._config.adaptive_tiering_enabled and self._config.promotion_enabled):
             return
+        if self._promotion_unavailable_reason is not None:
+            return                           # breaker tripped — no poller
         if self._promotion_task is not None and not self._promotion_task.done():
             return
         try:
@@ -675,7 +723,11 @@ class EmbeddingService:
     async def _promotion_loop(self) -> None:
         """Poll for headroom while degraded; exit once promoted or on shutdown."""
         try:
-            while not self._shutdown_requested and self._active_tier == EmbeddingTier.LITE:
+            while (
+                not self._shutdown_requested
+                and self._active_tier == EmbeddingTier.LITE
+                and self._promotion_unavailable_reason is None
+            ):
                 await asyncio.sleep(self._config.promotion_poll_s)
                 if self._shutdown_requested:
                     break

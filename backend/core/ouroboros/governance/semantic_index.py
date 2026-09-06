@@ -52,11 +52,26 @@ import time
 import dataclasses as _dc
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from backend.core.secure_logging import sanitize_for_log
 
 logger = logging.getLogger(__name__)
+
+#: Callers already warned about embedding on the loop thread — once each.
+_ON_LOOP_WARNED: "set" = set()
+
+
+def _on_loop_thread() -> bool:
+    """True when the CALLING thread is running an asyncio event loop — i.e.
+    this is the loop thread itself, where a blocking embed stalls every task
+    the organism has. A worker thread has no running loop and passes."""
+    try:
+        import asyncio  # noqa: PLC0415
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +486,10 @@ class IndexStats:
     refreshes: int = 0
     signals_scored: int = 0
     embed_failures: int = 0
+    # Embeds REFUSED because the caller was on the event-loop thread (see
+    # ``SemanticIndex._embed_guarded``). Non-zero means a loop-side caller
+    # is using the sync API where it must use an ``*_offloaded`` coroutine.
+    on_loop_refusals: int = 0
     by_source: Dict[str, int] = field(default_factory=dict)
     # Slice 3a extensions — always populated, zero when cluster_mode=centroid.
     cluster_mode: str = "centroid"
@@ -1813,7 +1832,7 @@ class SemanticIndex:
                 return True
 
             texts = [it.text for it in items]
-            vectors = self._embedder.embed(texts)
+            vectors = self._embed_guarded(texts)
             if vectors is None or len(vectors) != len(items):
                 # Embedder disabled — keep prior state, but mark a stat bump.
                 with self._lock:
@@ -2609,7 +2628,7 @@ class SemanticIndex:
         cleaned = _sanitize_corpus_text(text)
         if not cleaned:
             return 0.0
-        vec = self._embedder.embed([cleaned])
+        vec = self._embed_guarded([cleaned])
         if not vec:
             return 0.0
         sim, _winner, policy_used = self._score_and_align(vec[0])
@@ -2653,7 +2672,7 @@ class SemanticIndex:
         cleaned = _sanitize_corpus_text(text)
         if not cleaned:
             return 0
-        vec = self._embedder.embed([cleaned])
+        vec = self._embed_guarded([cleaned])
         if not vec:
             return 0
         sim, winner, policy_used = self._score_and_align(vec[0])
@@ -2717,7 +2736,7 @@ class SemanticIndex:
         cleaned = _sanitize_corpus_text(text)
         if not cleaned:
             return (0, 0.0)
-        vec = self._embedder.embed([cleaned])
+        vec = self._embed_guarded([cleaned])
         if not vec:
             return (0, 0.0)
         return self._score_vector_sync(vec[0])
@@ -2828,9 +2847,10 @@ class SemanticIndex:
                 offload,
                 is_offload_error,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — substrate absent: bare thread, never inline
             try:
-                return self._boost_and_score_sync(text or "")
+                import asyncio  # noqa: PLC0415
+                return await asyncio.to_thread(self._boost_and_score_sync, text or "")
             except Exception:  # noqa: BLE001
                 return (0, 0.0)
         with self._lock:
@@ -2851,6 +2871,67 @@ class SemanticIndex:
             return (int(boost), float(sim))
         except Exception:  # noqa: BLE001
             return (0, 0.0)
+
+    def _embed_guarded(self, texts: Sequence[str]) -> Optional[List[List[float]]]:
+        """The ONE seam every embed in this class passes through.
+
+        REFUSES on the event-loop thread. The fastembed/ONNX run is a
+        multi-second blocking call — measured 2026-09-06
+        (bt-2026-09-06-074921): two 5 s ``STUCK_FRAME`` stalls of the main
+        thread inside ``onnxruntime … run`` — and a refusal that answers
+        "unavailable" is the same answer a cold index gives, which every
+        caller already handles (boost 0, score 0.0, detail ``None``).
+        Loop-side callers use the ``*_offloaded`` coroutines, where this
+        same method runs on a worker thread and passes. Counted in
+        ``on_loop_refusals``; warned ONCE per calling method, with the
+        method named, so the surface that must move off-loop is greppable.
+        """
+        if _on_loop_thread():
+            import sys  # noqa: PLC0415
+            try:
+                caller = sys._getframe(1).f_code.co_name  # noqa: SLF001
+            except Exception:  # noqa: BLE001
+                caller = "?"
+            with self._lock:
+                self._stats.on_loop_refusals += 1
+            if caller not in _ON_LOOP_WARNED:
+                _ON_LOOP_WARNED.add(caller)
+                logger.warning(
+                    "[SemanticIndex] %s() called on the event-loop thread — "
+                    "embed refused (it would block the loop for seconds). Use "
+                    "the *_offloaded coroutine; further refusals are counted, "
+                    "not logged.", caller,
+                )
+            return None
+        return self._embedder.embed(list(texts))
+
+    async def _run_off_loop(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """Run a sync scoring method on a worker thread: the unified offload
+        substrate when present (the same one ``boost_and_score_offloaded``
+        uses), a bare thread when it is absent. Never inline on the loop."""
+        try:
+            from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501,PLC0415
+                offload,
+                is_offload_error,
+            )
+        except Exception:  # noqa: BLE001 — substrate import fault
+            import asyncio  # noqa: PLC0415
+            return await asyncio.to_thread(fn, *args)
+        res = await offload(fn, *args, cpu_bound=False)
+        if is_offload_error(res):
+            raise RuntimeError(f"offload failed: {res!r}")
+        return res
+
+    async def score_with_cluster_offloaded(self, text: str) -> Optional[Dict[str, Any]]:
+        """:meth:`score_with_cluster` off the event loop — the form a coroutine
+        must use. Fail-soft: ``None`` on any fault, never raised into the
+        loop."""
+        try:
+            return await self._run_off_loop(self.score_with_cluster, text)
+        except Exception:  # noqa: BLE001
+            logger.debug("[SemanticIndex] score_with_cluster_offloaded degraded",
+                         exc_info=True)
+            return None
 
     def score_with_cluster(self, text: str) -> Optional[Dict[str, Any]]:
         """Debug / evidence-stash API — returns full scoring detail.
@@ -2886,7 +2967,7 @@ class SemanticIndex:
         cleaned = _sanitize_corpus_text(text)
         if not cleaned:
             return None
-        vec = self._embedder.embed([cleaned])
+        vec = self._embed_guarded([cleaned])
         if not vec:
             return None
         sim, winner, policy_used = self._score_and_align(vec[0])
@@ -2993,7 +3074,7 @@ class SemanticIndex:
         if not corpus_snapshot:
             return ()
         try:
-            query_vecs = self._embedder.embed([cleaned])
+            query_vecs = self._embed_guarded([cleaned])
         except Exception:  # noqa: BLE001
             return ()
         if not query_vecs:
@@ -3007,7 +3088,7 @@ class SemanticIndex:
         # to amortize fastembed overhead.
         try:
             corpus_texts = [it.text for it in corpus_snapshot]
-            corpus_vecs = self._embedder.embed(corpus_texts)
+            corpus_vecs = self._embed_guarded(corpus_texts)
         except Exception:  # noqa: BLE001
             return ()
         if not corpus_vecs or len(corpus_vecs) != len(corpus_snapshot):
@@ -3246,6 +3327,7 @@ class SemanticIndex:
                 refreshes=self._stats.refreshes,
                 signals_scored=self._stats.signals_scored,
                 embed_failures=self._stats.embed_failures,
+                on_loop_refusals=self._stats.on_loop_refusals,
                 by_source=dict(self._stats.by_source),
                 # Slice 3a extensions.
                 cluster_mode=self._stats.cluster_mode,

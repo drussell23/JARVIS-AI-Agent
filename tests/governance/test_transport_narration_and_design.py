@@ -462,16 +462,42 @@ def test_local_tier_is_absent_when_its_lane_is_off(monkeypatch, local_lane):
     assert "local" not in str(ei.value) and not _FakeLocalClient.made
 
 
-def test_local_tier_is_last_unless_preferred(monkeypatch, local_lane):
+def test_local_tier_is_primary_when_its_lane_is_on(monkeypatch, local_lane):
+    """Zero marginal cost and sub-second: a metered cloud tier in front of
+    it can only add a failed round-trip (every intent paid a DW 503 first)."""
     import backend.core.ouroboros.governance.rt_gate as rtg
     monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "true")
     claude = MagicMock()
     claude.prompt_only = AsyncMock(return_value="claude says")
+    assert _run(rtg.gate_completion("p", caller_id="t", claude_provider=claude)) == "local says why"
+    claude.prompt_only.assert_not_called()
+
+
+def test_without_a_local_lane_the_cloud_order_is_unchanged(monkeypatch, local_lane):
+    import backend.core.ouroboros.governance.rt_gate as rtg
+    monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "false")
+    claude = MagicMock()
+    claude.prompt_only = AsyncMock(return_value="claude says")
     assert _run(rtg.gate_completion("p", caller_id="t", claude_provider=claude)) == "claude says"
-    assert not _FakeLocalClient.made                       # a paid host is byte-identical
-    assert _run(rtg.gate_completion(
-        "p", caller_id="t", claude_provider=claude, prefer="local")) == "local says why"
-    claude.prompt_only.assert_called_once()
+    assert not _FakeLocalClient.made
+
+
+def test_an_empty_tier_answer_is_a_distinct_diagnostic(monkeypatch, local_lane, caplog):
+    import logging
+    import backend.core.ouroboros.governance.rt_gate as rtg
+    monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "true")
+
+    class _Empty(_FakeLocalClient):
+        async def generate(self, *a, **k):
+            return SimpleNamespace(content="", model="m", latency_s=0.1, output_tokens=0)
+
+    monkeypatch.setattr(local_lane, "LocalPrimeClient", _Empty)
+    claude = MagicMock()
+    claude.prompt_only = AsyncMock(return_value="claude says")
+    with caplog.at_level(logging.INFO):
+        assert _run(rtg.gate_completion("p", caller_id="t", claude_provider=claude)) == "claude says"
+    assert any("exhausted/empty" in r.getMessage() and "local" in r.getMessage()
+               for r in caplog.records)
 
 
 def test_a_failing_local_tier_still_closes_its_session(monkeypatch, local_lane):

@@ -31,11 +31,20 @@ Design contract (Mandate 3 — no duplicated fallback logic in gate classes):
     is the locally served model: with no cloud key both cloud tiers fail
     at second zero and every gate raised, so nothing that speaks through
     a gate -- the narrated intent above an op, most visibly -- could ever
-    speak on that host. It sits LAST in every order (a paid host is
-    byte-identical) unless the caller prefers it, is gated by the lane's
-    own master (``JARVIS_LOCAL_PRIME_ENABLED``), and asks the client for
-    PROSE: the local client's JSON ladder is a per-call decision, and a
-    gate that wants a sentence does not want a candidate object.
+    speak on that host. Wherever its lane is enabled
+    (``JARVIS_LOCAL_PRIME_ENABLED``) it is the PRIMARY tier: its marginal
+    cost is zero and it answers a gate-sized prompt in well under a
+    second, so putting a metered, possibly-dead cloud tier in front of it
+    buys nothing and costs a failed round-trip per gate (measured: every
+    intent paid a DW 503 before the local lane was asked). The cloud
+    tiers remain the fallback, in the order the policy and ``prefer``
+    decide. The tier asks the client for PROSE: the local client's JSON
+    ladder is a per-call decision, and a gate that wants a sentence does
+    not want a candidate object.
+  * An EMPTY tier answer is logged distinctly (``exhausted/empty``) --
+    never a silent fall-through. The DreamEngine burned a whole soak
+    (bt-2026-07-17-033933) on a tier that returned 0 chars and logged
+    nothing; the lesson lives here now, once, for every gate.
 
 Env knobs:
   * ``JARVIS_GATE_CLAUDE_FIRST_ENABLED``  (default true)
@@ -47,7 +56,7 @@ import asyncio
 import contextlib
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +66,21 @@ _DEFAULT_SYSTEM = (
     "You are a senior AI reasoning engine for the JARVIS Trinity ecosystem. "
     "Think step by step and return well-structured output."
 )
+
+
+def _log_empty(tier: str, caller_id: str, raw: object, res: Any = None) -> None:
+    """An EMPTY answer is a distinct diagnostic, never a silent fall-through:
+    the tier was reached and produced nothing (the reasoning budget ate the
+    output, or the model declined). Reported with what the response object
+    can say about itself."""
+    logger.info(
+        "[RTGate] %s tier generation exhausted/empty for %s "
+        "(model=%s, %.1fs, out_tokens=%s) — cascading",
+        tier, caller_id,
+        getattr(res, "model", "?"),
+        float(getattr(res, "latency_s", -1.0) or -1.0),
+        getattr(res, "output_tokens", "?"),
+    )
 
 
 class GateProviderExhaustedError(RuntimeError):
@@ -106,6 +130,7 @@ async def _try_claude(
             )
             if raw:
                 return raw
+            _log_empty("claude(injected)", caller_id, raw)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — tier boundary, cascade on
@@ -128,6 +153,7 @@ async def _try_claude(
         )
         if raw:
             return raw
+        _log_empty("claude(fallback)", caller_id, raw)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -170,6 +196,7 @@ async def _try_dw_rt(
         raw = getattr(res, "content", "") or ""
         if raw:
             return raw
+        _log_empty("dw_rt", caller_id, raw, res)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -240,6 +267,7 @@ async def _try_local(
         raw = getattr(res, "content", "") or ""
         if raw:
             return raw
+        _log_empty("local", caller_id, raw, res)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -267,7 +295,19 @@ def local_tier_enabled() -> bool:
         return False
 
 
-async def gate_completion(
+def _accepts(accept: Optional[Callable[[str], bool]], raw: str) -> bool:
+    """Whether a tier's non-empty text satisfies the caller's shape check.
+    A predicate that raises REJECTS — the caller asked for a shape and the
+    text could not be shown to have it."""
+    if accept is None:
+        return True
+    try:
+        return bool(accept(raw))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def gate_completion_detailed(
     prompt: str,
     *,
     caller_id: str,
@@ -279,14 +319,18 @@ async def gate_completion(
     dw_provider: Any = None,
     dw_model: Optional[str] = None,
     prefer: Optional[str] = None,
-) -> str:
-    """Single-turn RT completion for a synchronous pipeline gate.
+    accept: Optional[Callable[[str], bool]] = None,
+) -> Tuple[str, str]:
+    """:func:`gate_completion`, also reporting WHICH tier answered.
 
-    Claude-RT first (buying time), DW-RT opportunistic fallback (availability),
-    per :mod:`rt_gate` module contract. Raises
-    :class:`GateProviderExhaustedError` when every tier fails — the caller's
-    own fail-open/fail-closed semantics take over from there. Never returns
-    an empty string.
+    Returns ``(text, tier)`` with ``tier`` in ``{"claude", "dw", "local"}``
+    — for callers that stamp provenance on what they got back (the
+    DreamEngine's ``_inference_provider``) without keeping a cascade of
+    their own to know it. ``accept`` lets a caller that needs a SHAPE (a
+    JSON object) reject a tier's text and cascade on, exactly as a failed
+    tier would; a rejection is logged so it never reads as a tier that was
+    not attempted. Raises :class:`GateProviderExhaustedError` when every
+    tier fails or is rejected.
     """
     t = timeout_s if timeout_s is not None else gate_rt_timeout_s()
     sys_p = system_prompt or _DEFAULT_SYSTEM
@@ -312,30 +356,65 @@ async def gate_completion(
             timeout_s=t,
         )
 
-    # PER-CALL tier order. `prefer` lets a caller that knows something
-    # about THIS payload (the adaptive lane router weighs it) put the
-    # right tier first, while the others stay the fallback — so a lane
-    # choice biases cost/latency and can never become a single point of
-    # failure. Unset → the global policy decides, exactly as before. The
-    # local tier joins the order only where its lane is enabled, LAST
-    # unless preferred: a host with paid lanes sees the order it always saw.
+    # PER-CALL tier order. The local lane, where enabled, is PRIMARY:
+    # zero marginal cost and sub-second for a gate-sized prompt, so a
+    # metered cloud tier in front of it can only add a failed round-trip.
+    # `prefer` orders the CLOUD fallback — it lets a caller that knows
+    # something about THIS payload (the adaptive lane router weighs it)
+    # put the right cloud tier first, so a lane choice biases cost/latency
+    # and can never become a single point of failure. Unset → the global
+    # policy decides. A host with no local lane sees the order it always saw.
     _pref = (prefer or "").strip().lower()
-    _cloud = (_claude, _dw) if claude_first_enabled() else (_dw, _claude)
+    _c, _d, _l = ("claude", _claude), ("dw", _dw), ("local", _local)
+    _cloud = (_c, _d) if claude_first_enabled() else (_d, _c)
     if _pref == "dw":
-        _cloud = (_dw, _claude)
+        _cloud = (_d, _c)
     elif _pref == "claude":
-        _cloud = (_claude, _dw)
-    _local_on = local_tier_enabled()
-    if _pref == "local" and _local_on:
-        tiers = (_local,) + _cloud
-    else:
-        tiers = _cloud + ((_local,) if _local_on else ())
-    for tier in tiers:
+        _cloud = (_c, _d)
+    tiers = ((_l,) if local_tier_enabled() else ()) + _cloud
+    for name, tier in tiers:
         raw = await tier()
-        if raw:
-            return raw
-    _names = {_claude: "claude", _dw: "dw", _local: "local"}
+        if not raw:
+            continue
+        if _accepts(accept, raw):
+            return raw, name
+        logger.info(
+            "[RTGate] %s tier answered for %s but the caller rejected the "
+            "shape (%d chars) — cascading", name, caller_id, len(raw),
+        )
     raise GateProviderExhaustedError(
         f"gate_completion exhausted all RT tiers (caller={caller_id}, "
-        f"order={','.join(_names[tier] for tier in tiers)})"
+        f"order={','.join(name for name, _tier in tiers)})"
     )
+
+
+async def gate_completion(
+    prompt: str,
+    *,
+    caller_id: str,
+    system_prompt: Optional[str] = None,
+    max_tokens: int = 512,
+    response_format: Optional[Dict[str, Any]] = None,
+    timeout_s: Optional[float] = None,
+    claude_provider: Any = None,
+    dw_provider: Any = None,
+    dw_model: Optional[str] = None,
+    prefer: Optional[str] = None,
+    accept: Optional[Callable[[str], bool]] = None,
+) -> str:
+    """Single-turn RT completion for a synchronous pipeline gate.
+
+    Claude-RT first (buying time), DW-RT opportunistic fallback (availability),
+    the local lane last where enabled, per :mod:`rt_gate` module contract.
+    Raises :class:`GateProviderExhaustedError` when every tier fails — the
+    caller's own fail-open/fail-closed semantics take over from there.
+    Never returns an empty string.
+    """
+    raw, _tier = await gate_completion_detailed(
+        prompt, caller_id=caller_id, system_prompt=system_prompt,
+        max_tokens=max_tokens, response_format=response_format,
+        timeout_s=timeout_s, claude_provider=claude_provider,
+        dw_provider=dw_provider, dw_model=dw_model, prefer=prefer,
+        accept=accept,
+    )
+    return raw

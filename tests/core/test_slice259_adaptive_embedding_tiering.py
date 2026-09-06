@@ -170,6 +170,74 @@ def test_promotion_high_load_failure_stays_on_lite(monkeypatch):
     assert asyncio.run(svc.maybe_promote_tier()) is False
     assert svc.active_tier == EmbeddingTier.LITE  # never lost the working LITE model
     assert svc._model.tag == "lite"
+    assert svc._promotion_unavailable_reason is None   # transient: keep polling
+
+
+def test_a_missing_package_trips_the_promotion_breaker(monkeypatch):
+    """An ImportError is not a transient condition. Once the HIGH tier's
+    package is known absent, promotion is disabled for the life of the
+    process: no further loads, no further budget reservations, no further
+    log lines — and the observability surface says why."""
+    svc = _fresh(monkeypatch, promotion_enabled=True, promotion_stable_checks=1)
+    svc._model = _FakeModel("lite")
+    svc._active_tier = EmbeddingTier.LITE
+    monkeypatch.setattr(svc, "_pytorch_headroom_available", lambda: True)
+    monkeypatch.setattr(svc, "_check_memory_budget", _granted)
+    calls = []
+
+    def _absent():
+        calls.append(1)
+        raise ModuleNotFoundError("No module named 'sentence_transformers'")
+
+    monkeypatch.setattr(svc, "_load_sentence_transformer", _absent)
+    assert asyncio.run(svc.maybe_promote_tier()) is False
+    assert "sentence_transformers" in (svc._promotion_unavailable_reason or "")
+    assert asyncio.run(svc.maybe_promote_tier()) is False
+    assert asyncio.run(svc.maybe_promote_tier()) is False
+    assert len(calls) == 1                                  # never retried
+    assert svc.tier_status()["promotion_unavailable_reason"]
+    assert svc.active_tier == EmbeddingTier.LITE and svc._model.tag == "lite"
+
+
+def test_a_wrapped_import_fault_still_trips_the_breaker(monkeypatch):
+    svc = _fresh(monkeypatch, promotion_enabled=True, promotion_stable_checks=1)
+    svc._model = _FakeModel("lite")
+    svc._active_tier = EmbeddingTier.LITE
+    monkeypatch.setattr(svc, "_pytorch_headroom_available", lambda: True)
+    monkeypatch.setattr(svc, "_check_memory_budget", _granted)
+
+    def _wrapped():
+        try:
+            raise ImportError("No module named 'torch'")
+        except ImportError as exc:
+            raise RuntimeError("constructor failed") from exc
+
+    monkeypatch.setattr(svc, "_load_sentence_transformer", _wrapped)
+    assert asyncio.run(svc.maybe_promote_tier()) is False
+    assert "torch" in (svc._promotion_unavailable_reason or "")
+
+
+def test_torch_absent_at_boot_never_starts_the_poller(monkeypatch):
+    """§3 demotion already trips the breaker, so the LITE→HIGH poller is
+    never scheduled for a package that is not there."""
+    svc = _fresh(monkeypatch, promotion_enabled=True)
+    monkeypatch.setattr(svc, "_check_memory_budget", _granted)
+
+    def _no_torch():
+        raise ImportError("No module named 'sentence_transformers'")
+
+    monkeypatch.setattr(svc, "_load_sentence_transformer", _no_torch)
+    monkeypatch.setattr(svc, "_lite_headroom_available", lambda: True)
+    monkeypatch.setattr(svc, "_make_fastembed_model", lambda factory=None: _FakeModel("lite"))
+
+    async def _go():
+        await svc._load_model()
+        svc._ensure_promotion_loop()
+        return svc._promotion_task
+
+    task = asyncio.run(_go())
+    assert svc._promotion_unavailable_reason
+    assert task is None
 
 
 # ── §7 observability ────────────────────────────────────────────────────

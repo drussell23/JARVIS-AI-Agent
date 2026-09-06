@@ -144,6 +144,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--files", nargs="*", default=[],
                     help="repo-relative paths this goal MAY touch — the cage "
                          "refuses an op that strays outside them")
+    ap.add_argument("--symbol", nargs="*", default=[],
+                    help="function/class name(s) inside --files the model must "
+                         "focus on — narrows generation + context slicing")
+    ap.add_argument("--success", default="",
+                    help="the operator's acceptance criterion for the goal")
     ap.add_argument("--note", default="", help="why this was authorized")
     ap.add_argument("--list", action="store_true", help="show current goals")
     ap.add_argument("--remove", default="", help="withdraw a goal by id")
@@ -157,89 +162,59 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.list:
         return cmd_list(doc)
 
-    goals: List[Dict[str, Any]] = list(doc.get("goals") or [])
+    # DRY: the authoring, signing and verify-before-replace all live in ONE
+    # place now — ``operator_goal_sanction`` — so the cockpit ``/goal`` verb
+    # and this CLI cannot drift. The old inline body wrote the goal key as
+    # ``files``; ``roadmap_reader._parse_goal_entry`` reads ``target_files``,
+    # so those goals parsed with EMPTY scope and the cage refused them
+    # ``goal_has_no_scope``. Delegating fixes that at the root.
+    sys.path.insert(0, str(_repo_root()))
+    from backend.core.ouroboros.governance.operator_goal_sanction import (  # noqa: E501,PLC0415
+        GoalSpec,
+        author_and_sign_goal,
+        withdraw_goal,
+    )
 
     if args.remove:
-        before = len(goals)
-        goals = [g for g in goals if str(g.get("id")) != args.remove]
-        if len(goals) == before:
-            print(f"REFUSING: no goal with id {args.remove!r}", file=sys.stderr)
+        res = withdraw_goal(args.remove, path_override=path)
+        if not res.ok:
+            print(f"REFUSING: {res.reason} — {res.detail}", file=sys.stderr)
             return 2
-        print(f"withdrawing {args.remove}")
-    else:
-        if not args.id:
-            ap.error("--id is required (or use --list / --remove)")
-        if not args.files:
-            # A goal with no file scope authorizes everything, which is the
-            # one shape that would make the cage meaningless.
-            ap.error("--files is required: an unscoped goal authorizes every "
-                     "file, which defeats the control it is asking to satisfy")
-        if any(str(g.get("id")) == args.id for g in goals):
-            print(f"REFUSING: goal {args.id!r} already exists — remove it "
-                  f"first, so an edit is never mistaken for the original",
-                  file=sys.stderr)
-            return 2
-        goals.append({
-            "id": args.id,
-            "title": args.title or args.id,
-            "description": args.description or args.title or args.id,
-            "files": [str(f) for f in args.files],
-        })
-        print(f"sanctioning {args.id} over {len(args.files)} file(s)")
-
-    doc["goals"] = goals
-    doc["signed_at"] = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    doc.setdefault("version", 1)
-    doc.setdefault("authority", "operator_directed")
-    doc.setdefault("source", "operator_directed_agent_signed")
-    doc["operator_id"] = (os.environ.get(ENV_OPERATOR_ID, "").strip()
-                          or doc.get("operator_id")
-                          or "operator-unspecified")
-    if args.note:
-        doc["note"] = args.note
-
-    secret = os.environ.get(ENV_SECRET, "").strip()
-    if not secret:
-        print(f"REFUSING: {ENV_SECRET} is not set. The signature IS the "
-              f"authorization; an unsigned roadmap is refused by the cage.",
-              file=sys.stderr)
-        return 2
-
-    sys.path.insert(0, str(_repo_root()))
-    from backend.core.ouroboros.governance.strategy_signer import (  # noqa: PLC0415
-        sign_roadmap_doc,
-    )
-    signed = sign_roadmap_doc(doc, secret)
-    if not signed.get("signature"):
-        print("REFUSING: signing produced no signature", file=sys.stderr)
-        return 2
-
-    import yaml  # noqa: PLC0415
-    rendered = yaml.safe_dump(signed, sort_keys=False, allow_unicode=True)
-
-    if args.dry_run:
-        print(rendered)
+        print(f"withdrew {res.goal_id}\n  {res.detail}")
         return 0
 
-    # Write to a sibling, VERIFY it through the reader the cage consults,
-    # and only then replace. A roadmap that does not verify is never allowed
-    # to become the live one: the cage would refuse every op against it and
-    # the reason would be three layers from the cause.
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".new")
-    tmp.write_text(rendered, encoding="utf-8")
-    ok, detail = _verify(tmp)
-    if not ok:
-        tmp.unlink(missing_ok=True)
-        print(f"REFUSING: the signed document does not verify ({detail}). "
-              f"{path} is unchanged.", file=sys.stderr)
-        return 2
+    if not args.id:
+        ap.error("--id is required (or use --list / --remove)")
+    if not args.files:
+        # A goal with no file scope authorizes everything, which is the one
+        # shape that would make the cage meaningless.
+        ap.error("--files is required: an unscoped goal authorizes every "
+                 "file, which defeats the control it is asking to satisfy")
 
-    if path.is_file():
-        shutil.copy2(path, path.with_suffix(path.suffix + ".prev"))
-    os.replace(tmp, path)
-    print(f"  signed and verified -> {path}")
-    print(f"  {detail}")
+    spec = GoalSpec(
+        goal_id=str(args.id),
+        title=str(args.title or args.id),
+        description=str(args.description or args.title or args.id),
+        target_files=tuple(str(f) for f in args.files),
+        target_symbols=tuple(str(s) for s in (args.symbol or [])),
+        success_criteria=str(args.success or ""),
+        note=str(args.note or ""),
+    )
+    print(f"sanctioning {spec.goal_id} over {len(spec.target_files)} file(s)")
+    res = author_and_sign_goal(
+        spec,
+        path_override=path,
+        operator_id=os.environ.get(ENV_OPERATOR_ID, "").strip() or None,
+        dry_run=args.dry_run,
+    )
+    if args.dry_run and res.ok:
+        print(res.detail)  # the rendered, would-be document
+        return 0
+    if not res.ok:
+        print(f"REFUSING: {res.reason} — {res.detail}", file=sys.stderr)
+        return 2
+    print(f"  signed and verified -> {res.roadmap_path}")
+    print(f"  {res.detail}")
     print("\n  The cage now accepts ops whose files fall inside this goal.")
     return 0
 
